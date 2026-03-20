@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -67,6 +68,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid data field", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("data: %+v", data)
 
 	if !verifyWebhookSignature(data, body.Signature) {
 		fmt.Printf("[webhook] signature mismatch for paymentLinkId=%s\n", data.PaymentLinkID)
