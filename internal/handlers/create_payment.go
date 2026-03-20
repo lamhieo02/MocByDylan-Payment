@@ -16,8 +16,8 @@ import (
 // createPaymentReq is the body sent from the Shopify storefront JS.
 type createPaymentReq struct {
 	OrderCode       int64      `json:"orderCode"`
-	Amount          int64      `json:"amount"`          // VND (e.g. 150000)
-	Description     string     `json:"description"`     // ≤9 chars
+	Amount          int64      `json:"amount"`      // VND (e.g. 150000)
+	Description     string     `json:"description"` // ≤9 chars
 	BuyerName       string     `json:"buyerName"`
 	BuyerEmail      string     `json:"buyerEmail"`
 	BuyerPhone      string     `json:"buyerPhone"`
@@ -119,6 +119,8 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := kv.Set(payosResp.PaymentLinkID, kvPayload, 20*60); err != nil {
 		fmt.Printf("[create-payment] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)
+		jsonErr(w, "failed to set KV: "+err.Error(), http.StatusBadGateway)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -24,6 +24,11 @@ func init() {
 			panic(fmt.Sprintf("kv: invalid REDIS_URL: %v", err))
 		}
 		rdb = redis.NewClient(opt)
+		// ping redis to test connectivity
+		err = rdb.Ping(context.Background()).Err()
+		if err != nil {
+			panic(fmt.Sprintf("kv: failed to ping redis: %v", err))
+		}
 	} else {
 		addr := os.Getenv("REDIS_ADDR")
 		if addr == "" {
