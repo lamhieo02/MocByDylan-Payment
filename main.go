@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -28,10 +27,8 @@ func main() {
 	mux.HandleFunc("/api/create-payment", handlers.CreatePayment)
 	mux.HandleFunc("/api/webhook", handlers.Webhook)
 	mux.HandleFunc("/api/payment-status", handlers.PaymentStatus)
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "ok")
-	})
+	mux.HandleFunc("/api/health", handlers.Health)
+	// mux.HandleFunc("/health", handlers.Health)
 
 	port := os.Getenv("PORT")
 	if port == "" {

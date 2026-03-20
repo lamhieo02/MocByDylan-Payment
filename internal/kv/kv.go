@@ -95,3 +95,8 @@ func IsProcessed(paymentLinkID string) (bool, error) {
 	}
 	return val != "", nil
 }
+
+// Ping checks connectivity to Redis (used by health checks).
+func Ping(ctx context.Context) error {
+	return rdb.Ping(ctx).Err()
+}
