@@ -7,23 +7,22 @@ import (
 
 	_ "github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/config"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/handlers"
-	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 )
 
 func main() {
 	// Auto-register the PayOS webhook URL on startup if configured.
 	// Set PAYOS_WEBHOOK_URL to the public URL of this server, e.g.:
 	//   https://your-app.railway.app/api/webhook
-	webHookURL := os.Getenv("PAYOS_WEBHOOK_URL")
-	// log debug
-	log.Printf("webHookURL: %s", webHookURL)
-	if webHookURL != "" {
-		if err := payos.RegisterWebhook(webHookURL); err != nil {
-			log.Printf("[payos] webhook registration failed: %v", err)
-		} else {
-			log.Printf("[payos] webhook registered: %s", webHookURL)
-		}
-	}
+	// webHookURL := os.Getenv("PAYOS_WEBHOOK_URL")
+	// // log debug
+	// log.Printf("webHookURL: %s", webHookURL)
+	// if webHookURL != "" {
+	// 	if err := payos.RegisterWebhook(webHookURL); err != nil {
+	// 		log.Printf("[payos] webhook registration failed: %v", err)
+	// 	} else {
+	// 		log.Printf("[payos] webhook registered: %s", webHookURL)
+	// 	}
+	// }
 
 	mux := http.NewServeMux()
 
