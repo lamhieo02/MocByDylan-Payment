@@ -1,0 +1,6 @@
+base.env
+.env
+.env*.local
+.vercel
+/server
+/shopify-mocbydylan-payos-payment

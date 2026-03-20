@@ -1,4 +1,4 @@
-package handler
+package handlers
 
 import (
 	"crypto/hmac"
@@ -9,23 +9,23 @@ import (
 	"os"
 	"time"
 
-	"github.com/mocbydylan/payos-backend/internal/kv"
-	"github.com/mocbydylan/payos-backend/internal/payos"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 )
 
-// CreatePaymentReq is the body sent from the Shopify storefront JS.
-type CreatePaymentReq struct {
-	OrderCode   int64       `json:"orderCode"`
-	Amount      int64       `json:"amount"`      // VND (e.g. 150000)
-	Description string      `json:"description"` // ≤9 chars
-	BuyerName   string      `json:"buyerName"`
-	BuyerEmail  string      `json:"buyerEmail"`
-	BuyerPhone  string      `json:"buyerPhone"`
-	LineItems   []LineItem  `json:"lineItems"`
+// createPaymentReq is the body sent from the Shopify storefront JS.
+type createPaymentReq struct {
+	OrderCode   int64      `json:"orderCode"`
+	Amount      int64      `json:"amount"`      // VND (e.g. 150000)
+	Description string     `json:"description"` // ≤9 chars
+	BuyerName   string     `json:"buyerName"`
+	BuyerEmail  string     `json:"buyerEmail"`
+	BuyerPhone  string     `json:"buyerPhone"`
+	LineItems   []lineItem `json:"lineItems"`
 }
 
-// LineItem mirrors what the Shopify cart JS provides.
-type LineItem struct {
+// lineItem mirrors what the Shopify cart JS provides.
+type lineItem struct {
 	VariantID int64  `json:"variantId"`
 	ProductID int64  `json:"productId"`
 	Title     string `json:"title"`
@@ -33,7 +33,8 @@ type LineItem struct {
 	Price     int64  `json:"price"` // Shopify internal units (× 100)
 }
 
-func Handler(w http.ResponseWriter, r *http.Request) {
+// CreatePayment handles POST /api/create-payment.
+func CreatePayment(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -44,7 +45,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req CreatePaymentReq
+	var req createPaymentReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, "invalid request body", http.StatusBadRequest)
 		return
@@ -54,7 +55,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Guarantee a unique int64 order code.
 	if req.OrderCode == 0 {
 		req.OrderCode = time.Now().UnixMilli()
 	}
@@ -72,7 +72,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	cancelURL := fmt.Sprintf("https://%s/pages/payment-result?status=cancelled", storeDomain)
 	returnURL := fmt.Sprintf("https://%s/pages/payment-result?status=success", storeDomain)
 
-	// Build and sign the PayOS payload.
 	sigInput := fmt.Sprintf(
 		"amount=%d&cancelUrl=%s&description=%s&orderCode=%d&returnUrl=%s",
 		req.Amount, cancelURL, desc, req.OrderCode, returnURL,
@@ -82,17 +81,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	mac.Write([]byte(sigInput))
 	signature := fmt.Sprintf("%x", mac.Sum(nil))
 
-	// Map local line items to PayOS items.
 	payosItems := make([]payos.Item, 0, len(req.LineItems))
 	for _, li := range req.LineItems {
 		payosItems = append(payosItems, payos.Item{
 			Name:     li.Title,
 			Quantity: li.Quantity,
-			Price:    li.Price / 100, // convert Shopify internal units → VND
+			Price:    li.Price / 100,
 		})
 	}
 
-	// Call PayOS to create the payment link.
 	payosResp, err := payos.CreatePaymentLink(payos.CreatePaymentRequest{
 		OrderCode:   req.OrderCode,
 		Amount:      req.Amount,
@@ -110,7 +107,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store the cart payload in KV so the webhook handler can create the Shopify order.
 	kvPayload := kv.CartPayload{
 		OrderCode:  req.OrderCode,
 		Amount:     req.Amount,
@@ -120,8 +116,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		LineItems:  toKVItems(req.LineItems),
 	}
 	if err := kv.Set(payosResp.PaymentLinkID, kvPayload, 20*60); err != nil {
-		// Non-fatal: log and continue. Webhook will still process (albeit without buyer info).
-		fmt.Printf("[payos-be] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)
+		fmt.Printf("[create-payment] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -133,8 +128,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// toKVItems converts the handler's LineItem slice to kv.LineItem slice.
-func toKVItems(items []LineItem) []kv.LineItem {
+func toKVItems(items []lineItem) []kv.LineItem {
 	out := make([]kv.LineItem, len(items))
 	for i, it := range items {
 		out[i] = kv.LineItem{
@@ -146,22 +140,4 @@ func toKVItems(items []LineItem) []kv.LineItem {
 		}
 	}
 	return out
-}
-
-func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	// Allow requests from Shopify storefronts only.
-	if origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-	} else {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	}
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
-func jsonErr(w http.ResponseWriter, msg string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

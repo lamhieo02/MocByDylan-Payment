@@ -135,6 +135,36 @@ func GetPaymentStatus(id string) (*PaymentStatus, error) {
 	return &data, nil
 }
 
+// RegisterWebhook calls POST /confirm-webhook to register or update the
+// webhook URL for the payment channel. Should be called once at server startup.
+// Required env vars: PAYOS_CLIENT_ID, PAYOS_API_KEY
+func RegisterWebhook(webhookURL string) error {
+	payload := map[string]string{"webhookUrl": webhookURL}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/confirm-webhook", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	authHeaders(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	var env payosEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("payos: bad response: %s", string(raw))
+	}
+	if env.Code != "00" {
+		return fmt.Errorf("payos: register webhook error %s: %s", env.Code, env.Desc)
+	}
+	return nil
+}
+
 // CancelPayment calls POST /v2/payment-requests/{id}/cancel.
 func CancelPayment(id, reason string) error {
 	payload := map[string]string{"cancellationReason": reason}

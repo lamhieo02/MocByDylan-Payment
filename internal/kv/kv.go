@@ -1,17 +1,37 @@
-// Package kv provides a thin client for Vercel KV (Upstash Redis REST API).
-// Required env vars: KV_REST_API_URL, KV_REST_API_TOKEN
+// Package kv provides a Redis client for storing cart payloads and deduplication flags.
+// Required env var: REDIS_URL (e.g. redis://default:password@host:6379)
+// Falls back to REDIS_ADDR (host:port, default localhost:6379) when REDIS_URL is not set.
 package kv
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
+
+var rdb *redis.Client
+
+func init() {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL != "" {
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			panic(fmt.Sprintf("kv: invalid REDIS_URL: %v", err))
+		}
+		rdb = redis.NewClient(opt)
+	} else {
+		addr := os.Getenv("REDIS_ADDR")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		rdb = redis.NewClient(&redis.Options{Addr: addr})
+	}
+}
 
 // LineItem mirrors a Shopify cart line item needed to create an order.
 type LineItem struct {
@@ -22,7 +42,7 @@ type LineItem struct {
 	Price     int64  `json:"price"` // Shopify internal units (price × 100)
 }
 
-// CartPayload is stored against the paymentLinkId key in KV.
+// CartPayload is stored against the paymentLinkId key in Redis.
 // The webhook handler reads this to create the Shopify order.
 type CartPayload struct {
 	OrderCode  int64      `json:"orderCode"`
@@ -33,89 +53,44 @@ type CartPayload struct {
 	LineItems  []LineItem `json:"lineItems"`
 }
 
-// upstashResponse is the envelope returned by every Upstash REST command.
-type upstashResponse struct {
-	Result interface{} `json:"result"`
-	Error  string      `json:"error"`
-}
-
-// restURL returns the base Upstash REST URL from env.
-func restURL() string { return os.Getenv("KV_REST_API_URL") }
-
-// token returns the Upstash bearer token from env.
-func token() string { return os.Getenv("KV_REST_API_TOKEN") }
-
-// exec sends a single Redis command to the Upstash REST endpoint.
-// cmd is a JSON array like ["SET", "key", "value", "EX", "1200"].
-func exec(cmd []interface{}) (interface{}, error) {
-	body, _ := json.Marshal(cmd)
-
-	req, err := http.NewRequest(http.MethodPost, restURL(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token())
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	var up upstashResponse
-	if err := json.Unmarshal(raw, &up); err != nil {
-		return nil, fmt.Errorf("kv: bad response: %s", string(raw))
-	}
-	if up.Error != "" {
-		return nil, errors.New("kv: " + up.Error)
-	}
-	return up.Result, nil
-}
-
 // Set stores value under key with a TTL (seconds). Value is JSON-encoded.
 func Set(key string, value interface{}, ttlSeconds int) error {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	_, err = exec([]interface{}{"SET", key, string(encoded), "EX", strconv.Itoa(ttlSeconds)})
-	return err
+	return rdb.Set(context.Background(), key, string(encoded), time.Duration(ttlSeconds)*time.Second).Err()
 }
 
 // GetCartPayload retrieves a CartPayload by key. Returns nil, nil when not found.
 func GetCartPayload(key string) (*CartPayload, error) {
-	result, err := exec([]interface{}{"GET", key})
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
+	val, err := rdb.Get(context.Background(), key).Result()
+	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
-	str, ok := result.(string)
-	if !ok {
-		return nil, fmt.Errorf("kv: unexpected type for GET result")
+	if err != nil {
+		return nil, fmt.Errorf("kv: GET %s: %w", key, err)
 	}
 	var payload CartPayload
-	if err := json.Unmarshal([]byte(str), &payload); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(val), &payload); err != nil {
+		return nil, fmt.Errorf("kv: unmarshal: %w", err)
 	}
 	return &payload, nil
 }
 
-// MarkProcessed sets a small flag key so duplicate webhooks are ignored.
-// Uses a 24-hour TTL.
+// MarkProcessed sets a flag key so duplicate webhooks are ignored. TTL: 24h.
 func MarkProcessed(paymentLinkID string) error {
-	_, err := exec([]interface{}{"SET", "processed:" + paymentLinkID, "1", "EX", "86400"})
-	return err
+	return rdb.Set(context.Background(), "processed:"+paymentLinkID, "1", 24*time.Hour).Err()
 }
 
 // IsProcessed returns true when the paymentLinkId has already been handled.
 func IsProcessed(paymentLinkID string) (bool, error) {
-	result, err := exec([]interface{}{"GET", "processed:" + paymentLinkID})
-	if err != nil {
-		return false, err
+	val, err := rdb.Get(context.Background(), "processed:"+paymentLinkID).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
 	}
-	return result != nil, nil
+	if err != nil {
+		return false, fmt.Errorf("kv: GET processed:%s: %w", paymentLinkID, err)
+	}
+	return val != "", nil
 }
