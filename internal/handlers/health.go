@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -15,7 +16,20 @@ type healthResponse struct {
 	Redis  string `json:"redis"`
 }
 
-// Health handles GET /health and GET /api/health.
+// Live handles GET /health — liveness for Railway/load balancers.
+// Does not call Redis so deploy succeeds even if Redis is still starting
+// or REDIS_URL is misconfigured (use /api/health to verify Redis).
+func Live(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintln(w, "ok")
+}
+
+// Health handles GET /api/health — readiness: pings Redis.
 // Returns 200 + JSON when Redis is reachable; 503 otherwise.
 func Health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -36,5 +50,5 @@ func Health(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode("ok")
+	_ = json.NewEncoder(w).Encode(healthResponse{Status: "ok", Redis: "ok"})
 }

@@ -28,7 +28,7 @@ func main() {
 	mux.HandleFunc("/api/webhook", handlers.Webhook)
 	mux.HandleFunc("/api/payment-status", handlers.PaymentStatus)
 	mux.HandleFunc("/api/health", handlers.Health)
-	mux.HandleFunc("/health", handlers.Health)
+	mux.HandleFunc("/health", handlers.Live)
 
 	port := os.Getenv("PORT")
 	if port == "" {
