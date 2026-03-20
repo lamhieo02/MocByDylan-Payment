@@ -1,17 +1,13 @@
 package handlers
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"sort"
-	"strings"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
 
@@ -68,11 +64,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// log.Printf("data: %+v", data)
-	// log.Printf("body: %+v", body)
-	// log.Printf("body.Signature: %s", body.Signature)
-
-	if !verifyWebhookSignature(data, body.Signature) {
+	// Signature must use raw `data` JSON so all keys match PayOS (including new fields).
+	if !payos.VerifyPaymentWebhookSignature(body.Data, body.Signature) {
 		fmt.Printf("[webhook] signature mismatch for paymentLinkId=%s\n", data.PaymentLinkID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -165,45 +158,6 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-}
-
-func verifyWebhookSignature(data webhookData, receivedSig string) bool {
-	fields := map[string]string{
-		"accountNumber":          data.AccountNumber,
-		"amount":                 fmt.Sprintf("%d", data.Amount),
-		"code":                   data.Code,
-		"counterAccountBankId":   data.CounterAccountBankID,
-		"counterAccountBankName": data.CounterAccountBankName,
-		"counterAccountName":     data.CounterAccountName,
-		"counterAccountNumber":   data.CounterAccountNumber,
-		"currency":               data.Currency,
-		"description":            data.Description,
-		"orderCode":              fmt.Sprintf("%d", data.OrderCode),
-		"paymentLinkId":          data.PaymentLinkID,
-		"reference":              data.Reference,
-		"transactionDateTime":    data.TransactionDateTime,
-		"virtualAccountName":     data.VirtualAccountName,
-		"virtualAccountNumber":   data.VirtualAccountNumber,
-	}
-
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	parts := make([]string, len(keys))
-	for i, k := range keys {
-		parts[i] = k + "=" + fields[k]
-	}
-	sigInput := strings.Join(parts, "&")
-
-	checksumKey := os.Getenv("PAYOS_CHECKSUM_KEY")
-	mac := hmac.New(sha256.New, []byte(checksumKey))
-	mac.Write([]byte(sigInput))
-	expected := fmt.Sprintf("%x", mac.Sum(nil))
-
-	return hmac.Equal([]byte(expected), []byte(receivedSig))
 }
 
 func toShopifyLineItems(items []kv.LineItem) []shopify.LineItem {
