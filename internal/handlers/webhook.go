@@ -79,6 +79,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	processed, err := kv.IsProcessed(data.PaymentLinkID)
 	if err != nil {
 		fmt.Printf("[webhook] KV IsProcessed error: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 	if processed {
 		fmt.Printf("[webhook] duplicate event for paymentLinkId=%s, skipping\n", data.PaymentLinkID)
@@ -89,11 +91,20 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	payload, err := kv.GetCartPayload(data.PaymentLinkID)
 	if err != nil || payload == nil {
 		fmt.Printf("[webhook] no KV payload for paymentLinkId=%s, building minimal order\n", data.PaymentLinkID)
-		payload = &kv.CartPayload{
-			OrderCode:  data.OrderCode,
-			Amount:     data.Amount,
-			BuyerEmail: "",
-		}
+		// payload = &kv.CartPayload{
+		// 	OrderCode:  data.OrderCode,
+		// 	Amount:     data.Amount,
+		// 	BuyerEmail: "",
+		// }
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// validate payload
+	if err := ValidateRequestDataWebhook(payload); err != nil {
+		fmt.Printf("[webhook] invalid payload for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
 	firstName, lastName := shopify.ParseName(payload.BuyerName)
