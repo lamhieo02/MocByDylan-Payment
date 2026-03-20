@@ -70,7 +70,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 	if !verifyWebhookSignature(data, body.Signature) {
 		fmt.Printf("[webhook] signature mismatch for paymentLinkId=%s\n", data.PaymentLinkID)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		http.Error(w, "invalid signature", http.StatusAccepted)
 		return
 	}
 
