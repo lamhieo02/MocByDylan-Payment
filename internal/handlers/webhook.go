@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -69,13 +68,13 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("data: %+v", data)
-	log.Printf("body: %+v", body)
-	log.Printf("body.Signature: %s", body.Signature)
+	// log.Printf("data: %+v", data)
+	// log.Printf("body: %+v", body)
+	// log.Printf("body.Signature: %s", body.Signature)
 
 	if !verifyWebhookSignature(data, body.Signature) {
 		fmt.Printf("[webhook] signature mismatch for paymentLinkId=%s\n", data.PaymentLinkID)
-		http.Error(w, "invalid signature", http.StatusBadGateway)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
 
