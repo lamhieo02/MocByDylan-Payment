@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24.0-alpine AS builder
 
 WORKDIR /app
 
@@ -8,7 +8,7 @@ RUN go mod download
 COPY . .
 RUN go build -ldflags="-s -w" -o server .
 
-FROM alpine:3.19
+FROM alpine:3.20
 
 RUN apk --no-cache add ca-certificates tzdata
 
