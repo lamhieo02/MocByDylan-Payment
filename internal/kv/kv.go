@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -29,6 +30,7 @@ func init() {
 		if err != nil {
 			panic(fmt.Sprintf("kv: failed to ping redis: %v", err))
 		}
+		log.Printf("kv: redis connected")
 	} else {
 		addr := os.Getenv("REDIS_ADDR")
 		if addr == "" {
