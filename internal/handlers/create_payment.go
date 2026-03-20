@@ -15,13 +15,14 @@ import (
 
 // createPaymentReq is the body sent from the Shopify storefront JS.
 type createPaymentReq struct {
-	OrderCode   int64      `json:"orderCode"`
-	Amount      int64      `json:"amount"`      // VND (e.g. 150000)
-	Description string     `json:"description"` // ≤9 chars
-	BuyerName   string     `json:"buyerName"`
-	BuyerEmail  string     `json:"buyerEmail"`
-	BuyerPhone  string     `json:"buyerPhone"`
-	LineItems   []lineItem `json:"lineItems"`
+	OrderCode       int64      `json:"orderCode"`
+	Amount          int64      `json:"amount"`          // VND (e.g. 150000)
+	Description     string     `json:"description"`     // ≤9 chars
+	BuyerName       string     `json:"buyerName"`
+	BuyerEmail      string     `json:"buyerEmail"`
+	BuyerPhone      string     `json:"buyerPhone"`
+	ShippingAddress string     `json:"shippingAddress"` // full address string
+	LineItems       []lineItem `json:"lineItems"`
 }
 
 // lineItem mirrors what the Shopify cart JS provides.
@@ -108,12 +109,13 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	kvPayload := kv.CartPayload{
-		OrderCode:  req.OrderCode,
-		Amount:     req.Amount,
-		BuyerName:  req.BuyerName,
-		BuyerEmail: req.BuyerEmail,
-		BuyerPhone: req.BuyerPhone,
-		LineItems:  toKVItems(req.LineItems),
+		OrderCode:       req.OrderCode,
+		Amount:          req.Amount,
+		BuyerName:       req.BuyerName,
+		BuyerEmail:      req.BuyerEmail,
+		BuyerPhone:      req.BuyerPhone,
+		ShippingAddress: req.ShippingAddress,
+		LineItems:       toKVItems(req.LineItems),
 	}
 	if err := kv.Set(payosResp.PaymentLinkID, kvPayload, 20*60); err != nil {
 		fmt.Printf("[create-payment] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)

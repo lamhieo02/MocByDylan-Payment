@@ -104,6 +104,18 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	amountStr := fmt.Sprintf("%d", data.Amount)
 	currency := "VND"
 
+	var shippingAddr *shopify.ShippingAddress
+	if payload.ShippingAddress != "" {
+		shippingAddr = &shopify.ShippingAddress{
+			FirstName:   firstName,
+			LastName:    lastName,
+			Phone:       payload.BuyerPhone,
+			Address1:    payload.ShippingAddress,
+			Country:     "Vietnam",
+			CountryCode: "VN",
+		}
+	}
+
 	orderReq := shopify.OrderRequest{
 		Order: shopify.OrderBody{
 			LineItems: lineItems,
@@ -113,6 +125,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 				FirstName: firstName,
 				LastName:  lastName,
 			},
+			ShippingAddress:        shippingAddr,
+			BillingAddress:         shippingAddr,
 			FinancialStatus: "paid",
 			Currency:        currency,
 			Transactions: []shopify.Transaction{

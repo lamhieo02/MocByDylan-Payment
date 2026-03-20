@@ -28,6 +28,19 @@ type Customer struct {
 	Phone     string `json:"phone,omitempty"`
 }
 
+// ShippingAddress is a Shopify order shipping/billing address.
+type ShippingAddress struct {
+	FirstName   string `json:"first_name,omitempty"`
+	LastName    string `json:"last_name,omitempty"`
+	Phone       string `json:"phone,omitempty"`
+	Address1    string `json:"address1,omitempty"`
+	City        string `json:"city,omitempty"`
+	Province    string `json:"province,omitempty"`
+	Country     string `json:"country,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+	Zip         string `json:"zip,omitempty"`
+}
+
 // Transaction records the PayOS payment against the order.
 type Transaction struct {
 	Kind          string `json:"kind"`
@@ -45,15 +58,17 @@ type OrderRequest struct {
 
 // OrderBody contains the order fields.
 type OrderBody struct {
-	LineItems               []LineItem    `json:"line_items"`
-	Customer                Customer      `json:"customer"`
-	FinancialStatus         string        `json:"financial_status"`
-	Currency                string        `json:"currency"`
-	Transactions            []Transaction `json:"transactions"`
-	Note                    string        `json:"note,omitempty"`
-	Tags                    string        `json:"tags,omitempty"`
-	SendReceipt             bool          `json:"send_receipt"`
-	SendFulfillmentReceipt  bool          `json:"send_fulfillment_receipt"`
+	LineItems              []LineItem       `json:"line_items"`
+	Customer               Customer         `json:"customer"`
+	ShippingAddress        *ShippingAddress `json:"shipping_address,omitempty"`
+	BillingAddress         *ShippingAddress `json:"billing_address,omitempty"`
+	FinancialStatus        string           `json:"financial_status"`
+	Currency               string           `json:"currency"`
+	Transactions           []Transaction    `json:"transactions"`
+	Note                   string           `json:"note,omitempty"`
+	Tags                   string           `json:"tags,omitempty"`
+	SendReceipt            bool             `json:"send_receipt"`
+	SendFulfillmentReceipt bool             `json:"send_fulfillment_receipt"`
 }
 
 // OrderResponse holds the created order fields we return to the frontend.
