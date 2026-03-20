@@ -107,3 +107,5 @@ func IsProcessed(paymentLinkID string) (bool, error) {
 func Ping(ctx context.Context) error {
 	return rdb.Ping(ctx).Err()
 }
+
+// aa
