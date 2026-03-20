@@ -14,11 +14,14 @@ func main() {
 	// Auto-register the PayOS webhook URL on startup if configured.
 	// Set PAYOS_WEBHOOK_URL to the public URL of this server, e.g.:
 	//   https://your-app.railway.app/api/webhook
-	if webhookURL := os.Getenv("PAYOS_WEBHOOK_URL"); webhookURL != "" {
-		if err := payos.RegisterWebhook(webhookURL); err != nil {
+	webHookURL := os.Getenv("PAYOS_WEBHOOK_URL")
+	// log debug
+	log.Printf("webHookURL: %s", webHookURL)
+	if webHookURL != "" {
+		if err := payos.RegisterWebhook(webHookURL); err != nil {
 			log.Printf("[payos] webhook registration failed: %v", err)
 		} else {
-			log.Printf("[payos] webhook registered: %s", webhookURL)
+			log.Printf("[payos] webhook registered: %s", webHookURL)
 		}
 	}
 
