@@ -32,6 +32,10 @@ func main() {
 	mux.HandleFunc("/api/health", handlers.Health)
 	mux.HandleFunc("/health", handlers.Live)
 
+	// Shopify OAuth flow
+	mux.HandleFunc("/auth", handlers.AuthInstall)
+	mux.HandleFunc("/auth/callback", handlers.AuthCallback)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
