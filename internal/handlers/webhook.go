@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
@@ -107,6 +108,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[webhook] payload: %+v", payload)
+
 	firstName, lastName := shopify.ParseName(payload.BuyerName)
 	lineItems := toShopifyLineItems(payload.LineItems)
 	amountStr := fmt.Sprintf("%d", data.Amount)
@@ -153,6 +156,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 			SendFulfillmentReceipt: true,
 		},
 	}
+
+	log.Printf("[webhook] orderReq: %+v", orderReq)
 
 	order, err := shopify.CreateOrder(orderReq)
 	if err != nil {
