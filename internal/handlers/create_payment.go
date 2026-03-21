@@ -123,6 +123,19 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// if err := db.SaveOrder(db.OrderRecord{
+	// 	PaymentLinkID:   payosResp.PaymentLinkID,
+	// 	OrderCode:       req.OrderCode,
+	// 	Amount:          req.Amount,
+	// 	BuyerName:       req.BuyerName,
+	// 	BuyerEmail:      req.BuyerEmail,
+	// 	BuyerPhone:      req.BuyerPhone,
+	// 	ShippingAddress: req.ShippingAddress,
+	// 	LineItems:       kvPayload.LineItems,
+	// }); err != nil {
+	// 	fmt.Printf("[create-payment] DB SaveOrder error for %s: %v\n", payosResp.PaymentLinkID, err)
+	// }
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"qrCode":        payosResp.QRCode,

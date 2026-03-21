@@ -112,14 +112,19 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 	firstName, lastName := shopify.ParseName(payload.BuyerName)
 	lineItems := toShopifyLineItems(payload.LineItems)
-	amountStr := fmt.Sprintf("%d", data.Amount)
-	currency := "VND"
+
+	// Shopify ignores shipping_address when either first_name or last_name is
+	// empty, so fall back to first_name when the buyer has only one name.
+	addrLastName := lastName
+	if addrLastName == "" {
+		addrLastName = firstName
+	}
 
 	var shippingAddr *shopify.ShippingAddress
 	if payload.ShippingAddress != "" {
 		shippingAddr = &shopify.ShippingAddress{
 			FirstName:   firstName,
-			LastName:    lastName,
+			LastName:    addrLastName,
 			Phone:       payload.BuyerPhone,
 			Address1:    payload.ShippingAddress,
 			Country:     "Vietnam",
@@ -127,47 +132,51 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	orderReq := shopify.OrderRequest{
-		Order: shopify.OrderBody{
+	draftReq := shopify.DraftOrderRequest{
+		DraftOrder: shopify.DraftOrderBody{
 			LineItems: lineItems,
-			Customer: shopify.Customer{
+			Customer: &shopify.Customer{
 				Email:     payload.BuyerEmail,
 				Phone:     payload.BuyerPhone,
 				FirstName: firstName,
 				LastName:  lastName,
 			},
+			Email:           payload.BuyerEmail,
 			ShippingAddress: shippingAddr,
 			BillingAddress:  shippingAddr,
-			FinancialStatus: "paid",
-			Currency:        currency,
-			Transactions: []shopify.Transaction{
-				{
-					Kind:          "sale",
-					Status:        "success",
-					Amount:        amountStr,
-					Currency:      currency,
-					Gateway:       "payos",
-					Authorization: data.PaymentLinkID,
-				},
-			},
-			Note:                   fmt.Sprintf("PayOS QR transfer. paymentLinkId: %s | ref: %s", data.PaymentLinkID, data.Reference),
-			Tags:                   "payos,qr-transfer",
-			SendReceipt:            true,
-			SendFulfillmentReceipt: true,
+			Note:            fmt.Sprintf("PayOS QR transfer. paymentLinkId: %s | ref: %s", data.PaymentLinkID, data.Reference),
+			Tags:            "payos,qr-transfer",
 		},
 	}
 
-	log.Printf("[webhook] orderReq: %+v", orderReq)
+	log.Printf("[webhook] draftReq: %+v", draftReq)
 
-	order, err := shopify.CreateOrder(orderReq)
+	draft, err := shopify.CreateDraftOrder(draftReq)
 	if err != nil {
-		fmt.Printf("[webhook] Shopify order creation failed for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		fmt.Printf("[webhook] Shopify draft order creation failed for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
+		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
+		// }
 		http.Error(w, "order creation failed", http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Printf("[webhook] Shopify order created: %s (id=%d) for paymentLinkId=%s\n",
-		order.Name, order.ID, data.PaymentLinkID)
+	completed, err := shopify.CompleteDraftOrder(draft.ID)
+	if err != nil {
+		fmt.Printf("[webhook] Shopify complete draft order failed for paymentLinkId=%s (draft=%d): %v\n", data.PaymentLinkID, draft.ID, err)
+		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
+		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
+		// }
+		http.Error(w, "order completion failed", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
+		completed.Name, completed.OrderID, data.PaymentLinkID)
+
+	// if err := db.UpdateOrderPaid(data.PaymentLinkID, completed.OrderID, completed.Name, data.Reference, data.TransactionDateTime); err != nil {
+	// 	fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
+	// }
 
 	if err := kv.MarkProcessed(data.PaymentLinkID); err != nil {
 		fmt.Printf("[webhook] KV MarkProcessed error: %v\n", err)

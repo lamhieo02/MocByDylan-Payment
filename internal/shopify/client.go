@@ -12,7 +12,11 @@ import (
 	"strings"
 )
 
-const apiVersion = "2024-10"
+const apiVersion = "2026-01"
+
+// HTTPClient is the HTTP client used for all Shopify API calls.
+// Override in tests to inject a mock server.
+var HTTPClient *http.Client = http.DefaultClient
 
 // LineItem is a Shopify order line item.
 type LineItem struct {
@@ -63,7 +67,6 @@ type OrderBody struct {
 	ShippingAddress        *ShippingAddress `json:"shipping_address,omitempty"`
 	BillingAddress         *ShippingAddress `json:"billing_address,omitempty"`
 	FinancialStatus        string           `json:"financial_status"`
-	Currency               string           `json:"currency"`
 	Transactions           []Transaction    `json:"transactions"`
 	Note                   string           `json:"note,omitempty"`
 	Tags                   string           `json:"tags,omitempty"`
@@ -106,7 +109,7 @@ func CreateOrder(req OrderRequest) (*OrderResponse, error) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Shopify-Access-Token", os.Getenv("SHOPIFY_ADMIN_API_TOKEN"))
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := HTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +127,104 @@ func CreateOrder(req OrderRequest) (*OrderResponse, error) {
 	}
 	return &env.Order, nil
 }
+
+// ─── Draft Order ────────────────────────────────────────────────────────────
+
+// DraftOrderRequest is the top-level payload for POST /draft_orders.json.
+type DraftOrderRequest struct {
+	DraftOrder DraftOrderBody `json:"draft_order"`
+}
+
+// DraftOrderBody contains the fields accepted by POST /draft_orders.json.
+// Unlike OrderBody, financial_status and transactions are not sent here;
+// payment is recorded by calling CompleteDraftOrder after creation.
+type DraftOrderBody struct {
+	LineItems       []LineItem       `json:"line_items"`
+	Customer        *Customer        `json:"customer,omitempty"`
+	Email           string           `json:"email,omitempty"`
+	ShippingAddress *ShippingAddress `json:"shipping_address,omitempty"`
+	BillingAddress  *ShippingAddress `json:"billing_address,omitempty"`
+	Note            string           `json:"note,omitempty"`
+	Tags            string           `json:"tags,omitempty"`
+}
+
+// DraftOrderResponse holds the fields returned by the Shopify DraftOrder API.
+// After CompleteDraftOrder, OrderID contains the resulting Shopify order ID.
+type DraftOrderResponse struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	OrderID    int64  `json:"order_id"`
+	Status     string `json:"status"`
+	InvoiceURL string `json:"invoice_url"`
+}
+
+type draftOrderEnvelope struct {
+	DraftOrder DraftOrderResponse `json:"draft_order"`
+}
+
+// CreateDraftOrder creates a new draft order via the Shopify Admin API.
+// Call CompleteDraftOrder afterwards to convert it into a paid order.
+func CreateDraftOrder(req DraftOrderRequest) (*DraftOrderResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequest(http.MethodPost, adminURL("draft_orders.json"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Shopify-Access-Token", os.Getenv("SHOPIFY_ADMIN_API_TOKEN"))
+
+	resp, err := HTTPClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("shopify: HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var env draftOrderEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("shopify: cannot parse draft order response: %w", err)
+	}
+	return &env.DraftOrder, nil
+}
+
+// CompleteDraftOrder marks the draft order as paid and converts it into a
+// regular Shopify order. The returned DraftOrderResponse.OrderID contains
+// the ID of the resulting order.
+func CompleteDraftOrder(draftOrderID int64) (*DraftOrderResponse, error) {
+	url := adminURL(fmt.Sprintf("draft_orders/%d/complete.json", draftOrderID))
+	httpReq, err := http.NewRequest(http.MethodPut, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("X-Shopify-Access-Token", os.Getenv("SHOPIFY_ADMIN_API_TOKEN"))
+
+	resp, err := HTTPClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("shopify: HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var env draftOrderEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("shopify: cannot parse complete draft order response: %w", err)
+	}
+	return &env.DraftOrder, nil
+}
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
 
 // ParseName splits "Nguyen Van A" into first + last name parts.
 // Returns first, last. If only one word, it becomes first_name.
