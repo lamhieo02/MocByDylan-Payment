@@ -43,6 +43,11 @@ type webhookData struct {
 // Webhook handles POST /api/webhook — receives PayOS payment notifications,
 // verifies the HMAC signature, and creates a paid Shopify order.
 func Webhook(w http.ResponseWriter, r *http.Request) {
+	var (
+		completeOrderName string
+		completeOrderID   int64
+	)
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -150,6 +155,9 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	completeOrderName = draftReq.DraftOrder.Customer.Phone
+	completeOrderID = 999999999999
+
 	log.Printf("[webhook] draftReq: %+v", draftReq)
 
 	draft, err := shopify.CreateDraftOrder(draftReq)
@@ -160,24 +168,26 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		// }
 		// http.Error(w, "order creation failed", http.StatusInternalServerError)
 		// return
+	} else {
+
+		completed, err := shopify.CompleteDraftOrder(draft.ID)
+		if err != nil {
+			fmt.Printf("[webhook] Shopify complete draft order failed for paymentLinkId=%s (draft=%d): %v\n", data.PaymentLinkID, draft.ID, err)
+			// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
+			// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
+			// }
+			// http.Error(w, "order completion failed", http.StatusInternalServerError)
+			// return
+		} else {
+			fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
+				completed.Name, completed.OrderID, data.PaymentLinkID)
+			// if err := db.UpdateOrderPaid(data.PaymentLinkID, completed.OrderID, completed.Name, data.Reference, data.TransactionDateTime); err != nil {
+			// 	fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
+			// }
+			completeOrderName = completed.Name
+			completeOrderID = completed.OrderID
+		}
 	}
-
-	completed, err := shopify.CompleteDraftOrder(draft.ID)
-	if err != nil {
-		fmt.Printf("[webhook] Shopify complete draft order failed for paymentLinkId=%s (draft=%d): %v\n", data.PaymentLinkID, draft.ID, err)
-		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
-		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
-		// }
-		// http.Error(w, "order completion failed", http.StatusInternalServerError)
-		// return
-	}
-
-	fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
-		completed.Name, completed.OrderID, data.PaymentLinkID)
-
-	// if err := db.UpdateOrderPaid(data.PaymentLinkID, completed.OrderID, completed.Name, data.Reference, data.TransactionDateTime); err != nil {
-	// 	fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
-	// }
 
 	// Build line items for the email notification.
 	mailItems := make([]mailer.LineItem, 0, len(payload.LineItems))
@@ -190,8 +200,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	mailer.SendOrderNotification(mailer.Notification{
-		ShopifyOrderName:    completed.Name,
-		ShopifyOrderID:      completed.OrderID,
+		ShopifyOrderName:    completeOrderName,
+		ShopifyOrderID:      completeOrderID,
 		PaymentLinkID:       data.PaymentLinkID,
 		Reference:           data.Reference,
 		TransactionDatetime: data.TransactionDateTime,
