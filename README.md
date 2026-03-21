@@ -17,7 +17,7 @@ Shopify Cart (payos-qr.liquid)
       ├─ verify HMAC_SHA256 signature
       ├─ idempotency check (KV)
       ├─ lookup cartPayload from KV
-      └─ POST /admin/api/2024-10/orders.json (Shopify Admin)
+      └─ POST /admin/api/.../orders.json (Shopify CreateOrder, optional — lỗi vẫn OK, DB là nguồn truth)
 ```
 
 ## Environment variables
@@ -37,6 +37,23 @@ Copy `.env.example` to `.env` and fill in all values before deploying.
 | `SMTP_HOST` / `SMTP_PORT` | Fallback SMTP: hostname (vd. `smtp.gmail.com`, `smtp.sendgrid.net`), **không dùng IP** |
 | `SMTP_USER` / `SMTP_PASSWORD` | Gmail: user = full email + [App Password](https://myaccount.google.com/apppasswords); port `587` hoặc `465` |
 | `MAIL_FROM` / `MAIL_TO` | Tuỳ chọn From/To (Resend hoặc SMTP) |
+| `DATABASE_URL` | PostgreSQL (Railway, …) — lưu đơn để trace & giao hàng |
+
+## Orders trong PostgreSQL (`DATABASE_URL`)
+
+Sau **create-payment**: insert `pending` với `payment_link_id`, khách, địa chỉ, `line_items` (JSON), số tiền.  
+Sau **webhook** thanh toán OK + Shopify: `paid` + `shopify_order_id` / `shopify_order_name` + PayOS ref.  
+Lỗi Shopify: `failed` + `note`.
+
+Ví dụ tra cứu để giao hàng:
+
+```sql
+SELECT payment_link_id, status, buyer_name, buyer_email, buyer_phone,
+       shipping_address, line_items, amount, shopify_order_name, payos_reference, updated_at
+FROM orders
+WHERE payment_link_id = '...'
+ORDER BY updated_at DESC LIMIT 20;
+```
 
 ## Shopify app setup
 

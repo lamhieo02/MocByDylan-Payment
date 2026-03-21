@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
 )
 
 type healthResponse struct {
-	Status string `json:"status"`
-	Redis  string `json:"redis"`
+	Status    string `json:"status"`
+	Redis     string `json:"redis"`
+	Postgres  string `json:"postgres,omitempty"` // "ok" | "error" | omitted if DATABASE_URL unset
 }
 
 // Live handles GET /health — liveness for Railway/load balancers.
@@ -48,7 +51,21 @@ func Health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := healthResponse{Status: "ok", Redis: "ok"}
+	if os.Getenv("DATABASE_URL") != "" {
+		if err := db.Ping(ctx); err != nil {
+			log.Printf("[health] postgres ping failed: %v", err)
+			resp.Status = "unhealthy"
+			resp.Postgres = "error"
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		resp.Postgres = "ok"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(healthResponse{Status: "ok", Redis: "ok"})
+	_ = json.NewEncoder(w).Encode(resp)
 }

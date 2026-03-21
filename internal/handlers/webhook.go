@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/mailer"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
@@ -43,11 +44,6 @@ type webhookData struct {
 // Webhook handles POST /api/webhook — receives PayOS payment notifications,
 // verifies the HMAC signature, and creates a paid Shopify order.
 func Webhook(w http.ResponseWriter, r *http.Request) {
-	var (
-		completeOrderName string
-		completeOrderID   int64
-	)
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -138,55 +134,56 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	draftReq := shopify.DraftOrderRequest{
-		DraftOrder: shopify.DraftOrderBody{
+	amountStr := fmt.Sprintf("%.2f", float64(data.Amount))
+	orderNote := fmt.Sprintf("PayOS QR transfer. paymentLinkId: %s | ref: %s", data.PaymentLinkID, data.Reference)
+
+	orderReq := shopify.OrderRequest{
+		Order: shopify.OrderBody{
 			LineItems: lineItems,
-			Customer: &shopify.Customer{
+			Customer: shopify.Customer{
 				Email:     payload.BuyerEmail,
 				Phone:     payload.BuyerPhone,
 				FirstName: firstName,
 				LastName:  lastName,
 			},
-			Email:           payload.BuyerEmail,
-			ShippingAddress: shippingAddr,
-			BillingAddress:  shippingAddr,
-			Note:            fmt.Sprintf("PayOS QR transfer. paymentLinkId: %s | ref: %s", data.PaymentLinkID, data.Reference),
-			Tags:            "payos,qr-transfer",
+			ShippingAddress:        shippingAddr,
+			BillingAddress:         shippingAddr,
+			FinancialStatus:        "paid",
+			Transactions: []shopify.Transaction{{
+				Kind:          "sale",
+				Status:        "success",
+				Amount:        amountStr,
+				Currency:      "VND",
+				Gateway:       "payos",
+				Authorization: data.PaymentLinkID,
+			}},
+			Note:                   orderNote,
+			Tags:                   "payos,qr-transfer",
+			SendReceipt:            false,
+			SendFulfillmentReceipt: false,
 		},
 	}
 
-	completeOrderName = draftReq.DraftOrder.Customer.Phone
-	completeOrderID = 999999999999
+	log.Printf("[webhook] orderReq (CreateOrder): %+v", orderReq)
 
-	log.Printf("[webhook] draftReq: %+v", draftReq)
+	var shopifyOrderID int64
+	var shopifyOrderName string
+	var dbNote string
 
-	draft, err := shopify.CreateDraftOrder(draftReq)
-	if err != nil {
-		fmt.Printf("[webhook] Shopify draft order creation failed for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
-		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
-		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
-		// }
-		// http.Error(w, "order creation failed", http.StatusInternalServerError)
-		// return
+	created, shopifyErr := shopify.CreateOrder(orderReq)
+	if shopifyErr != nil {
+		// Nice-to-have: payment is already successful — DB is source of truth for fulfillment.
+		fmt.Printf("[webhook] Shopify CreateOrder failed (bypass) paymentLinkId=%s: %v\n", data.PaymentLinkID, shopifyErr)
+		dbNote = "shopify CreateOrder: " + shopifyErr.Error()
 	} else {
+		shopifyOrderID = created.ID
+		shopifyOrderName = created.Name
+		fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
+			shopifyOrderName, shopifyOrderID, data.PaymentLinkID)
+	}
 
-		completed, err := shopify.CompleteDraftOrder(draft.ID)
-		if err != nil {
-			fmt.Printf("[webhook] Shopify complete draft order failed for paymentLinkId=%s (draft=%d): %v\n", data.PaymentLinkID, draft.ID, err)
-			// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
-			// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
-			// }
-			// http.Error(w, "order completion failed", http.StatusInternalServerError)
-			// return
-		} else {
-			fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
-				completed.Name, completed.OrderID, data.PaymentLinkID)
-			// if err := db.UpdateOrderPaid(data.PaymentLinkID, completed.OrderID, completed.Name, data.Reference, data.TransactionDateTime); err != nil {
-			// 	fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
-			// }
-			completeOrderName = completed.Name
-			completeOrderID = completed.OrderID
-		}
+	if err := db.UpdateOrderPaid(data.PaymentLinkID, shopifyOrderID, shopifyOrderName, data.Reference, data.TransactionDateTime, dbNote); err != nil {
+		fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
 	}
 
 	// Build line items for the email notification.
@@ -199,9 +196,13 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 			Price:     it.Price / 100, // convert Shopify units → VND
 		})
 	}
+	mailOrderName := shopifyOrderName
+	if mailOrderName == "" {
+		mailOrderName = "— (chưa tạo trên Shopify — tra DB)"
+	}
 	mailer.SendOrderNotification(mailer.Notification{
-		ShopifyOrderName:    completeOrderName,
-		ShopifyOrderID:      completeOrderID,
+		ShopifyOrderName:    mailOrderName,
+		ShopifyOrderID:      shopifyOrderID,
 		PaymentLinkID:       data.PaymentLinkID,
 		Reference:           data.Reference,
 		TransactionDatetime: data.TransactionDateTime,
