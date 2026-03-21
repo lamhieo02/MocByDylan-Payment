@@ -158,8 +158,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
 		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
 		// }
-		http.Error(w, "order creation failed", http.StatusInternalServerError)
-		return
+		// http.Error(w, "order creation failed", http.StatusInternalServerError)
+		// return
 	}
 
 	completed, err := shopify.CompleteDraftOrder(draft.ID)
@@ -168,8 +168,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		// if dbErr := db.UpdateOrderFailed(data.PaymentLinkID, err.Error()); dbErr != nil {
 		// 	fmt.Printf("[webhook] DB UpdateOrderFailed error: %v\n", dbErr)
 		// }
-		http.Error(w, "order completion failed", http.StatusInternalServerError)
-		return
+		// http.Error(w, "order completion failed", http.StatusInternalServerError)
+		// return
 	}
 
 	fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
