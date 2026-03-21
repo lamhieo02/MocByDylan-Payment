@@ -33,6 +33,10 @@ Copy `.env.example` to `.env` and fill in all values before deploying.
 | `SHOPIFY_ADMIN_API_TOKEN` | Shopify Admin → Settings → Apps → Develop apps → API credentials |
 | `KV_REST_API_URL` | Vercel project → Storage → KV → `.env.local` |
 | `KV_REST_API_TOKEN` | Vercel project → Storage → KV → `.env.local` |
+| `RESEND_API_KEY` | [Resend](https://resend.com) → API Keys (HTTPS). **Ưu tiên** nếu có. |
+| `SMTP_HOST` / `SMTP_PORT` | Fallback SMTP: hostname (vd. `smtp.gmail.com`, `smtp.sendgrid.net`), **không dùng IP** |
+| `SMTP_USER` / `SMTP_PASSWORD` | Gmail: user = full email + [App Password](https://myaccount.google.com/apppasswords); port `587` hoặc `465` |
+| `MAIL_FROM` / `MAIL_TO` | Tuỳ chọn From/To (Resend hoặc SMTP) |
 
 ## Shopify app setup
 
