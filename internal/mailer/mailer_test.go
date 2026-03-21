@@ -1,13 +1,15 @@
 package mailer
 
 import (
+	"encoding/json"
 	"errors"
-	"net/smtp"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
-
-	gomail "github.com/jordan-wright/email"
+	"time"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -31,128 +33,214 @@ func sampleNotification() Notification {
 	}
 }
 
-// capturedSend records what was passed to the fake sendFn.
-type capturedSend struct {
-	email *gomail.Email
-	addr  string
-}
+// ── TestSend_NoConfig ─────────────────────────────────────────────────────────
 
-// stubSend replaces sendFn and captures the call. Returns the supplied error.
-func stubSend(returnErr error) (restore func(), cap *capturedSend) {
-	cap = &capturedSend{}
-	orig := sendFn
-	sendFn = func(e *gomail.Email, addr string, _ smtp.Auth) error {
-		cap.email = e
-		cap.addr = addr
-		return returnErr
+func TestSend_NoConfig(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_PASSWORD", "")
+	if err := send(sampleNotification()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
 	}
-	return func() { sendFn = orig }, cap
 }
 
-// ── TestSend_Success ──────────────────────────────────────────────────────────
+// ── TestSend_ResendSuccess ───────────────────────────────────────────────────
 
-// send() must call sendFn with the correct SMTP address when SMTP_PASSWORD is set.
-func TestSend_Success(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "kzag yiig mbxz gapy")
+func TestSend_ResendSuccess(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "re_test_key")
+	t.Setenv("SMTP_PASSWORD", "") // Resend wins
+	t.Setenv("MAIL_FROM", "")
+	t.Setenv("MAIL_TO", "")
 
-	restore, cap := stubSend(nil)
-	defer restore()
+	var gotAuth string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"abc"}`))
+	}))
+	defer srv.Close()
+
+	origClient := mailHTTPClient
+	origBase := resendAPIBase
+	resendAPIBase = srv.URL
+	mailHTTPClient = srv.Client()
+	mailHTTPClient.Timeout = 5 * time.Second
+	defer func() {
+		mailHTTPClient = origClient
+		resendAPIBase = origBase
+	}()
 
 	if err := send(sampleNotification()); err != nil {
-		t.Fatalf("expected nil error, got: %v", err)
+		t.Fatalf("send: %v", err)
+	}
+	if gotAuth != "Bearer re_test_key" {
+		t.Errorf("Authorization = %q, want Bearer re_test_key", gotAuth)
 	}
 
-	wantAddr := smtpHost + ":" + smtpPort
-	if cap.addr != wantAddr {
-		t.Errorf("addr = %q, want %q", cap.addr, wantAddr)
+	var p resendEmailPayload
+	if err := json.Unmarshal(gotBody, &p); err != nil {
+		t.Fatalf("payload json: %v", err)
 	}
-}
-
-// ── TestSend_EmailEnvelope ────────────────────────────────────────────────────
-
-// The email struct must have the correct From and To fields.
-func TestSend_EmailEnvelope(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "kzagyiigmbxzgapy")
-
-	restore, cap := stubSend(nil)
-	defer restore()
-
-	_ = send(sampleNotification())
-
-	wantFrom := "PayOS Backend Notifier <" + fromAddr + ">"
-	if cap.email.From != wantFrom {
-		t.Errorf("From = %q, want %q", cap.email.From, wantFrom)
+	if p.From != defaultFromResend {
+		t.Errorf("From = %q, want %q", p.From, defaultFromResend)
 	}
-	if len(cap.email.To) != 1 || cap.email.To[0] != toAddr {
-		t.Errorf("To = %v, want [%q]", cap.email.To, toAddr)
+	if len(p.To) != 1 || p.To[0] != defaultTo {
+		t.Errorf("To = %v, want [%q]", p.To, defaultTo)
+	}
+	if !strings.Contains(p.Subject, "#D42") || !strings.Contains(p.Subject, "179,000 VNĐ") {
+		t.Errorf("Subject = %q", p.Subject)
+	}
+	if !strings.Contains(p.HTML, "Lâm Nguyễn") {
+		t.Error("HTML missing buyer name")
 	}
 }
 
-// ── TestSend_SubjectContainsOrderName ────────────────────────────────────────
+// ── TestSend_ResendCustomFromTo ───────────────────────────────────────────────
 
-// Subject must contain the Shopify order name and formatted amount.
-func TestSend_SubjectContainsOrderName(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "test-app-password")
+func TestSend_ResendCustomFromTo(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "re_test_key")
+	t.Setenv("SMTP_PASSWORD", "")
+	t.Setenv("MAIL_FROM", "PayOS <notify@example.com>")
+	t.Setenv("MAIL_TO", "other@example.com")
 
-	restore, cap := stubSend(nil)
-	defer restore()
-
-	n := sampleNotification()
-	_ = send(n)
-
-	if !strings.Contains(cap.email.Subject, n.ShopifyOrderName) {
-		t.Errorf("Subject %q missing order name %q", cap.email.Subject, n.ShopifyOrderName)
-	}
-	if !strings.Contains(cap.email.Subject, "179,000 VNĐ") {
-		t.Errorf("Subject %q missing formatted amount", cap.email.Subject)
-	}
-}
-
-// ── TestSend_HTMLBodyContainsFields ──────────────────────────────────────────
-
-// The HTML body must contain all key order fields.
-func TestSend_HTMLBodyContainsFields(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "test-app-password")
-
-	restore, cap := stubSend(nil)
-	defer restore()
-
-	n := sampleNotification()
-	_ = send(n)
-
-	body := string(cap.email.HTML)
-	wantSubstrings := []string{
-		n.BuyerName,
-		n.BuyerEmail,
-		n.BuyerPhone,
-		n.ShippingAddress,
-		n.ShopifyOrderName,
-		"179,000 VNĐ",
-		n.Reference,
-		n.PaymentLinkID,
-		"Áo thun nam",
-		"Variant #44965664260279",
-	}
-	for _, want := range wantSubstrings {
-		if !strings.Contains(body, want) {
-			t.Errorf("HTML body missing %q", want)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var p resendEmailPayload
+		_ = json.Unmarshal(body, &p)
+		if p.From != "PayOS <notify@example.com>" {
+			t.Errorf("From = %q", p.From)
 		}
+		if len(p.To) != 1 || p.To[0] != "other@example.com" {
+			t.Errorf("To = %v", p.To)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	origClient := mailHTTPClient
+	origBase := resendAPIBase
+	resendAPIBase = srv.URL
+	mailHTTPClient = srv.Client()
+	defer func() {
+		mailHTTPClient = origClient
+		resendAPIBase = origBase
+	}()
+
+	if err := send(sampleNotification()); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// ── TestSend_SMTPError ────────────────────────────────────────────────────────
+// ── TestSend_ResendAPIError ───────────────────────────────────────────────────
 
-// When sendFn returns an error, send() must propagate it.
-func TestSend_SMTPError(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "test-app-password")
+func TestSend_ResendAPIError(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "re_bad")
+	t.Setenv("SMTP_PASSWORD", "")
 
-	want := errors.New("smtp: connection refused")
-	restore, _ := stubSend(want)
-	defer restore()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"Invalid API key"}`))
+	}))
+	defer srv.Close()
+
+	origClient := mailHTTPClient
+	origBase := resendAPIBase
+	resendAPIBase = srv.URL
+	mailHTTPClient = srv.Client()
+	defer func() {
+		mailHTTPClient = origClient
+		resendAPIBase = origBase
+	}()
 
 	err := send(sampleNotification())
-	if !errors.Is(err, want) {
-		t.Errorf("error = %v, want %v", err, want)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("error should mention 401: %v", err)
+	}
+}
+
+// ── TestSend_SMTPFallbackMocked ─────────────────────────────────────────────
+
+// Resend unset → SMTP path; sendSMTPFunc mocked.
+func TestSend_SMTPFallbackMocked(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_PASSWORD", "app-password")
+	t.Setenv("SMTP_HOST", "smtp.gmail.com")
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("SMTP_USER", "sender@gmail.com")
+	t.Setenv("MAIL_FROM", "")
+	t.Setenv("MAIL_TO", "recv@example.com")
+
+	var gotSubject, gotHTML string
+	orig := sendSMTPFunc
+	sendSMTPFunc = func(subject, html, _ string) error {
+		gotSubject = subject
+		gotHTML = html
+		return nil
+	}
+	defer func() { sendSMTPFunc = orig }()
+
+	if err := send(sampleNotification()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotSubject, "#D42") {
+		t.Errorf("subject %q", gotSubject)
+	}
+	if !strings.Contains(gotHTML, "Lâm Nguyễn") {
+		t.Error("missing html")
+	}
+}
+
+// ── TestSend_SMTPRejectIPHost ─────────────────────────────────────────────────
+
+func TestSend_SMTPRejectIPHost(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_PASSWORD", "x")
+	t.Setenv("SMTP_HOST", "64.233.170.109")
+	t.Setenv("SMTP_USER", "a@b.com")
+
+	err := send(sampleNotification())
+	if err == nil {
+		t.Fatal("expected error for IP SMTP host")
+	}
+	if !strings.Contains(err.Error(), "hostname") {
+		t.Errorf("want hostname hint: %v", err)
+	}
+}
+
+// ── TestSend_SMTPMissingUser ──────────────────────────────────────────────────
+
+func TestSend_SMTPMissingUser(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_PASSWORD", "x")
+	t.Setenv("SMTP_HOST", "smtp.gmail.com")
+	t.Setenv("SMTP_USER", "")
+	t.Setenv("MAIL_FROM", "No Angle Brackets")
+
+	err := send(sampleNotification())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "SMTP_USER") {
+		t.Errorf("got %v", err)
+	}
+}
+
+// ── TestValidateSMTPHost ─────────────────────────────────────────────────────
+
+func TestValidateSMTPHost(t *testing.T) {
+	for _, host := range []string{"smtp.gmail.com", "smtp.sendgrid.net"} {
+		if err := validateSMTPHost(host); err != nil {
+			t.Errorf("%q: %v", host, err)
+		}
+	}
+	for _, host := range []string{"127.0.0.1", "::1", "192.168.1.1"} {
+		if err := validateSMTPHost(host); err == nil {
+			t.Errorf("%q should be rejected", host)
+		}
 	}
 }
 
@@ -231,29 +319,77 @@ func TestBuildHTML_NoPhoneOrAddress(t *testing.T) {
 // ── TestSend_NoLineItems ──────────────────────────────────────────────────────
 
 func TestSend_NoLineItems(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "test-app-password")
+	t.Setenv("RESEND_API_KEY", "re_x")
+	t.Setenv("SMTP_PASSWORD", "")
 
-	restore, _ := stubSend(nil)
-	defer restore()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	origClient := mailHTTPClient
+	origBase := resendAPIBase
+	resendAPIBase = srv.URL
+	mailHTTPClient = srv.Client()
+	defer func() {
+		mailHTTPClient = origClient
+		resendAPIBase = origBase
+	}()
 
 	n := sampleNotification()
 	n.LineItems = nil
-
 	if err := send(n); err != nil {
-		t.Fatalf("unexpected error with empty line items: %v", err)
+		t.Fatal(err)
 	}
 }
 
-// ── TestSend_RealEmail ────────────────────────────────────────────────────────
+// ── TestSend_RealEmail_Resend ─────────────────────────────────────────────────
 
-// Integration test: actually sends an email via Gmail SMTP.
-// Run manually: SMTP_PASSWORD=xxxx go test -run TestSend_RealEmail -v ./internal/mailer/
-func TestSend_RealEmail(t *testing.T) {
-	t.Setenv("SMTP_PASSWORD", "")
-	if os.Getenv("SMTP_PASSWORD") == "" {
-		t.Skip("SMTP_PASSWORD not set — skipping real send test")
+// Run: RESEND_API_KEY=re_xxx go test -run TestSend_RealEmail_Resend -v ./internal/mailer/
+func TestSend_RealEmail_Resend(t *testing.T) {
+	if os.Getenv("RESEND_API_KEY") == "" {
+		t.Skip("RESEND_API_KEY not set — skipping real Resend test")
 	}
+	t.Setenv("SMTP_PASSWORD", "") // force Resend
 	if err := send(sampleNotification()); err != nil {
 		t.Fatalf("send failed: %v", err)
+	}
+}
+
+// ── TestSend_RealEmail_SMTP ───────────────────────────────────────────────────
+
+// Run: SMTP_PASSWORD=apppass SMTP_USER=you@gmail.com go test -run TestSend_RealEmail_SMTP -v ./internal/mailer/
+func TestSend_RealEmail_SMTP(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	os.Setenv("SMTP_PASSWORD", "333")
+	if os.Getenv("SMTP_PASSWORD") == "" {
+		t.Skip("SMTP_PASSWORD not set — skipping real SMTP test")
+	}
+	// if os.Getenv("SMTP_USER") == "" && !strings.Contains(os.Getenv("MAIL_FROM"), "@") {
+	// 	t.Skip("set SMTP_USER or MAIL_FROM with <email@...>")
+	// }
+	os.Setenv("SMTP_USER", "lamlklk2002@gmail.com")
+	os.Setenv("MAIL_FROM", "PayOS Backend Notifier <lamlklk2002@gmail.com>")
+	os.Setenv("MAIL_TO", "lamfan011@gmail.com")
+	if err := send(sampleNotification()); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+}
+
+// ── TestSendSMTPFuncErrorPropagates ───────────────────────────────────────────
+
+func TestSendSMTPFuncErrorPropagates(t *testing.T) {
+	t.Setenv("RESEND_API_KEY", "")
+	t.Setenv("SMTP_PASSWORD", "x")
+	t.Setenv("SMTP_USER", "a@b.com")
+
+	want := errors.New("smtp down")
+	orig := sendSMTPFunc
+	sendSMTPFunc = func(_, _, _ string) error { return want }
+	defer func() { sendSMTPFunc = orig }()
+
+	err := send(sampleNotification())
+	if !errors.Is(err, want) {
+		t.Errorf("err = %v, want %v", err, want)
 	}
 }
