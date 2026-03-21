@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/mailer"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
@@ -177,6 +178,30 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	// if err := db.UpdateOrderPaid(data.PaymentLinkID, completed.OrderID, completed.Name, data.Reference, data.TransactionDateTime); err != nil {
 	// 	fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
 	// }
+
+	// Build line items for the email notification.
+	mailItems := make([]mailer.LineItem, 0, len(payload.LineItems))
+	for _, it := range payload.LineItems {
+		mailItems = append(mailItems, mailer.LineItem{
+			Title:     it.Title,
+			VariantID: it.VariantID,
+			Quantity:  it.Quantity,
+			Price:     it.Price / 100, // convert Shopify units → VND
+		})
+	}
+	mailer.SendOrderNotification(mailer.Notification{
+		ShopifyOrderName:    completed.Name,
+		ShopifyOrderID:      completed.OrderID,
+		PaymentLinkID:       data.PaymentLinkID,
+		Reference:           data.Reference,
+		TransactionDatetime: data.TransactionDateTime,
+		Amount:              data.Amount,
+		BuyerName:           payload.BuyerName,
+		BuyerEmail:          payload.BuyerEmail,
+		BuyerPhone:          payload.BuyerPhone,
+		ShippingAddress:     payload.ShippingAddress,
+		LineItems:           mailItems,
+	})
 
 	if err := kv.MarkProcessed(data.PaymentLinkID); err != nil {
 		fmt.Printf("[webhook] KV MarkProcessed error: %v\n", err)

@@ -1,13 +1,19 @@
 // Package db manages the PostgreSQL connection and order persistence.
-// Required env var: DATABASE_URL (postgres connection string)
-// If DATABASE_URL is not set, all operations are silently skipped (no-op).
+// // Required env var: DATABASE_URL (postgres connection string)
+// // If DATABASE_URL is not set, all operations are silently skipped (no-op).
 package db
 
-import (
-	"github.com/jackc/pgx/v5/pgxpool"
-)
+// import (
+// 	"context"
+// 	"encoding/json"
+// 	"fmt"
+// 	"log"
+// 	"os"
 
-var pool *pgxpool.Pool
+// 	"github.com/jackc/pgx/v5/pgxpool"
+// )
+
+// var pool *pgxpool.Pool
 
 // func init() {
 // 	dsn := os.Getenv("DATABASE_URL")
