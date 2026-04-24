@@ -10,8 +10,12 @@ import (
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/notify"
 )
 
+const (
+	DISCORD_NOTIFY_ORDER_WEBHOOK = "https://discord.com/api/webhooks/1497093069307252777/pLRIwspCk6zqy33TtOgCxNC5DPUbrnxlhQlTvKQ7JjsjL8blb0F7D7Vo6F-FyhPaLboo"
+)
+
 func main() {
-	notify.Init(os.Getenv("DISCORD_NOTIFY_ORDER_WEBHOOK"))
+	notify.Init(DISCORD_NOTIFY_ORDER_WEBHOOK)
 
 	// Auto-register the PayOS webhook URL on startup if configured.
 	// Set PAYOS_WEBHOOK_URL to the public URL of this server, e.g.:
