@@ -21,12 +21,10 @@ func newTestNotifier(channels map[discord.ChannelName]string) discord.INotifier 
 		Channels: channels,
 	})
 }
-	return errors.New("xinchao cac ban")
-}
 
 // nolint
 func a() error {
-	if err := c(); err != nil {
+	if err := errors.New("xinchao cac ban"); err != nil {
 		return err
 	}
 	return nil
