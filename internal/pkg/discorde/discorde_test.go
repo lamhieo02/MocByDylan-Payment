@@ -10,7 +10,7 @@ import (
 
 const (
 	_logoURL        = "https://raw.githubusercontent.com/lamhieo02/MocByDylan-Payment/main/assets/logo.png"
-	_notifyOrderURL = "https://discord.com/api/webhooks/1497093069307252777/pLRIwspCk6zqy33TtOgCxNC5DPUbrnxlhQlTvKQ7JjsjL8blb0F7D7Vo6F-FyhPaLboo"
+	_notifyOrderURL = ""
 	_warningURL     = "https://discord.com/api/webhooks/1299202911741411328/2v39qdz1AvLkuxCt3aYZvaJva1sKHDcAp0ZMNI_nhbDgwtebgpToqNhtXSaYxLv-OwgS"
 )
 
