@@ -7,9 +7,12 @@ import (
 
 	_ "github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/config"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/handlers"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/notify"
 )
 
 func main() {
+	notify.Init(os.Getenv("DISCORD_NOTIFY_ORDER_WEBHOOK"))
+
 	// Auto-register the PayOS webhook URL on startup if configured.
 	// Set PAYOS_WEBHOOK_URL to the public URL of this server, e.g.:
 	//   https://your-app.railway.app/api/webhook

@@ -10,6 +10,7 @@ import (
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/mailer"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/notify"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
@@ -168,12 +169,14 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 	var shopifyOrderID int64
 	var shopifyOrderName string
+	var shopifyErrMsg string
 	var dbNote string
 
 	created, shopifyErr := shopify.CreateOrder(orderReq)
 	if shopifyErr != nil {
 		// Nice-to-have: payment is already successful — DB is source of truth for fulfillment.
 		fmt.Printf("[webhook] Shopify CreateOrder failed (bypass) paymentLinkId=%s: %v\n", data.PaymentLinkID, shopifyErr)
+		shopifyErrMsg = shopifyErr.Error()
 		dbNote = "shopify CreateOrder: " + shopifyErr.Error()
 	} else {
 		shopifyOrderID = created.ID
@@ -185,6 +188,26 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	if err := db.UpdateOrderPaid(data.PaymentLinkID, shopifyOrderID, shopifyOrderName, data.Reference, data.TransactionDateTime, dbNote); err != nil {
 		fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
 	}
+
+	notify.SendOrderNotify(notify.OrderInfo{
+		OrderCode:              data.OrderCode,
+		Amount:                 data.Amount,
+		PaymentLinkID:          data.PaymentLinkID,
+		Reference:              data.Reference,
+		TransactionDateTime:    data.TransactionDateTime,
+		AccountNumber:          data.AccountNumber,
+		CounterAccountBankName: data.CounterAccountBankName,
+		CounterAccountName:     data.CounterAccountName,
+		CounterAccountNumber:   data.CounterAccountNumber,
+		BuyerName:              payload.BuyerName,
+		BuyerEmail:             payload.BuyerEmail,
+		BuyerPhone:             payload.BuyerPhone,
+		ShippingAddress:        payload.ShippingAddress,
+		LineItems:              payload.LineItems,
+		ShopifyOrderID:         shopifyOrderID,
+		ShopifyOrderName:       shopifyOrderName,
+		ShopifyErr:             shopifyErrMsg,
+	})
 
 	// Build line items for the email notification.
 	mailItems := make([]mailer.LineItem, 0, len(payload.LineItems))
