@@ -108,4 +108,8 @@ func Ping(ctx context.Context) error {
 	return rdb.Ping(ctx).Err()
 }
 
-// aa
+// Client returns the underlying *redis.Client.
+// Use this to pass Redis access to other packages that need raw client operations.
+func Client() *redis.Client {
+	return rdb
+}

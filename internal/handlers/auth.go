@@ -2,18 +2,18 @@ package handlers
 
 // Shopify OAuth 2.0 flow
 //
-// Step 1 – /auth?shop=xxx.myshopify.com
+// Step 1 – GET /auth?shop=xxx.myshopify.com
 //   Merchant clicks "Install" → Shopify redirects here.
 //   We validate the shop domain, generate a cryptographic state token,
 //   store it in memory, and redirect the browser to Shopify's authorize URL.
 //
-// Step 2 – /auth/callback?code=...&shop=...&state=...&hmac=...
+// Step 2 – GET /auth/callback?code=...&shop=...&state=...&hmac=...
 //   Shopify redirects back here after the merchant approves.
 //   We verify:
 //     a. state token matches what we stored (CSRF protection)
 //     b. hmac matches the HMAC-SHA256 we compute from the query params
-//   Then we exchange the one-time code for a permanent access token by
-//   POSTing to https://{shop}/admin/oauth/access_token.
+//   Then we exchange the one-time code for a permanent access token and
+//   cache it in Redis so all subsequent Shopify API calls skip the exchange.
 
 import (
 	"crypto/hmac"
@@ -31,28 +31,39 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
 
 // stateStore holds nonces keyed by their hex value.
-// sync.Map is safe for concurrent use without explicit locking.
 var stateStore sync.Map
 
 // shopDomainRE validates a Shopify myshopify.com domain.
 var shopDomainRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$`)
 
+// AuthHandler handles the Shopify OAuth installation flow.
+// It caches the resulting access token via the injected TokenProvider.
+type AuthHandler struct {
+	tokenProvider shopify.TokenProvider
+}
+
+// NewAuthHandler creates an AuthHandler with the given token provider.
+func NewAuthHandler(tp shopify.TokenProvider) *AuthHandler {
+	return &AuthHandler{tokenProvider: tp}
+}
+
 // ── Step 1: Initiate OAuth ────────────────────────────────────────────────────
 
-// AuthInstall handles GET /auth?shop={shop_domain}.
+// Install handles GET /auth?shop={shop_domain}.
 // It validates the shop, creates a state nonce, and redirects the browser to
 // Shopify's OAuth authorize endpoint.
-func AuthInstall(w http.ResponseWriter, r *http.Request) {
+func (h *AuthHandler) Install(w http.ResponseWriter, r *http.Request) {
 	shop := strings.TrimSpace(r.URL.Query().Get("shop"))
 	if !shopDomainRE.MatchString(shop) {
 		jsonErr(w, "missing or invalid shop parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Generate a 16-byte random state token to prevent CSRF.
 	stateBytes := make([]byte, 16)
 	if _, err := rand.Read(stateBytes); err != nil {
 		jsonErr(w, "failed to generate state", http.StatusInternalServerError)
@@ -61,7 +72,6 @@ func AuthInstall(w http.ResponseWriter, r *http.Request) {
 	state := hex.EncodeToString(stateBytes)
 	stateStore.Store(state, true)
 
-	// Build the Shopify OAuth authorize URL.
 	params := url.Values{
 		"client_id":    {os.Getenv("SHOPIFY_CLIENT_ID")},
 		"scope":        {os.Getenv("SHOPIFY_SCOPES")},
@@ -74,9 +84,10 @@ func AuthInstall(w http.ResponseWriter, r *http.Request) {
 
 // ── Step 2: Handle callback ───────────────────────────────────────────────────
 
-// AuthCallback handles GET /auth/callback?code=...&shop=...&state=...&hmac=...
-// It validates state + HMAC, then exchanges the code for an access token.
-func AuthCallback(w http.ResponseWriter, r *http.Request) {
+// Callback handles GET /auth/callback?code=...&shop=...&state=...&hmac=...
+// It validates state + HMAC, exchanges the code for an access token, and
+// caches the token in Redis (TTL = 30 days).
+func (h *AuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	shop := q.Get("shop")
 	state := q.Get("state")
@@ -98,12 +109,17 @@ func AuthCallback(w http.ResponseWriter, r *http.Request) {
 	// (c) Exchange the temporary code for a permanent access token.
 	token, err := exchangeCodeForToken(shop, code)
 	if err != nil {
-		log.Printf("[shopify oauth] token exchange error: %v", err)
+		log.Printf("[shopify oauth] OAuth exchange failure for %s: %v", shop, err)
 		jsonErr(w, "failed to obtain access token", http.StatusBadGateway)
 		return
 	}
+	log.Printf("[shopify oauth] OAuth exchange success for %s", shop)
 
-	log.Printf("[SUCCESS] shop=%s token=%s", shop, token)
+	// (d) Cache the token in Redis so future requests skip the exchange.
+	if cacheErr := h.tokenProvider.CacheToken(r.Context(), shop, token); cacheErr != nil {
+		// Non-fatal: log and continue — the token is still returned to the caller.
+		log.Printf("[shopify oauth] token cache error for %s: %v", shop, cacheErr)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -114,17 +130,7 @@ func AuthCallback(w http.ResponseWriter, r *http.Request) {
 
 // ── HMAC Validation ───────────────────────────────────────────────────────────
 
-// validateHMAC verifies the HMAC-SHA256 signature that Shopify appends to the
-// callback URL.
-//
-// Algorithm (per Shopify docs):
-//  1. Remove the "hmac" key from the query parameters.
-//  2. Sort remaining keys alphabetically.
-//  3. Build the message string as "key=value&key=value".
-//  4. Compute HMAC-SHA256 of the message using the client secret.
-//  5. Compare (constant-time) with the provided hmac value.
 func validateHMAC(q url.Values, receivedHMAC string) bool {
-	// Collect all params except "hmac".
 	pairs := make([]string, 0, len(q))
 	for key, values := range q {
 		if key == "hmac" {
@@ -140,14 +146,11 @@ func validateHMAC(q url.Values, receivedHMAC string) bool {
 	mac.Write([]byte(message))
 	expectedHMAC := hex.EncodeToString(mac.Sum(nil))
 
-	// Constant-time comparison prevents timing attacks.
 	return hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC))
 }
 
 // ── Token Exchange ────────────────────────────────────────────────────────────
 
-// exchangeCodeForToken POSTs to Shopify's token endpoint and returns the
-// permanent access token.
 func exchangeCodeForToken(shop, code string) (string, error) {
 	endpoint := fmt.Sprintf("https://%s/admin/oauth/access_token", shop)
 
