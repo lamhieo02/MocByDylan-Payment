@@ -17,22 +17,32 @@ type SelectedOption struct {
 	Value string `json:"value"`
 }
 
+// Collection is a Shopify collection the product belongs to.
+type Collection struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Handle string `json:"handle"`
+}
+
 // InventoryItem represents a product variant with its current available quantity.
-// New fields (variantTitle, selectedOptions, displayVariant, size) are additive;
-// existing fields are unchanged for backward compatibility.
+// Fields are only ever added, never removed, to preserve backward compatibility.
 type InventoryItem struct {
-	// Existing fields — unchanged.
+	// Original fields.
 	InventoryItemID string `json:"inventoryItemId"`
 	Title           string `json:"title"` // product title
 	SKU             string `json:"sku"`
 	Image           string `json:"image"`
 	Quantity        int    `json:"quantity"`
 
-	// New fields — added to support variant-level display and search.
+	// Variant-level fields (added for size/option display and search).
 	VariantTitle    string           `json:"variantTitle"`
 	SelectedOptions []SelectedOption `json:"selectedOptions"`
 	DisplayVariant  string           `json:"displayVariant"` // Size > Color > VariantTitle > ""
 	Size            string           `json:"size"`           // shortcut for the Size option value
+
+	// Collection fields (added for dashboard collection filtering).
+	Collections    []Collection `json:"collections"`
+	CollectionType string       `json:"collectionType"` // first recognised Mộc* collection, else "Other"
 }
 
 // ShopifyClient is the abstraction for inventory operations against Shopify Admin GraphQL.
@@ -223,6 +233,15 @@ query ListInventory($query: String, $cursor: String, $locationId: ID!) {
         featuredImage {
           url
         }
+        collections(first: 20) {
+          edges {
+            node {
+              id
+              title
+              handle
+            }
+          }
+        }
         variants(first: 100) {
           edges {
             node {
@@ -264,6 +283,15 @@ type gqlProductsResponse struct {
 				FeaturedImage *struct {
 					URL string `json:"url"`
 				} `json:"featuredImage"`
+				Collections struct {
+					Edges []struct {
+						Node struct {
+							ID     string `json:"id"`
+							Title  string `json:"title"`
+							Handle string `json:"handle"`
+						} `json:"node"`
+					} `json:"edges"`
+				} `json:"collections"`
 				Variants struct {
 					Edges []struct {
 						Node struct {
@@ -353,6 +381,31 @@ func resolveSize(opts []SelectedOption) string {
 	return ""
 }
 
+// mocCollectionPriority is the ordered list of recognised Mộc collection titles.
+// The first title that matches any of the product's collections is used as
+// collectionType. Products belonging to none of these are labelled "Other".
+var mocCollectionPriority = []string{
+	"Mộc Wear",
+	"Mộc Care",
+	"Mộc Figure",
+	"Mộc Charm",
+	"Mộc Living",
+}
+
+// resolveCollectionType returns the first recognised Mộc collection title
+// found in cols, preserving the priority order defined in mocCollectionPriority.
+// Returns "Other" when no recognised collection is present.
+func resolveCollectionType(cols []Collection) string {
+	for _, priority := range mocCollectionPriority {
+		for _, c := range cols {
+			if strings.EqualFold(c.Title, priority) {
+				return c.Title
+			}
+		}
+	}
+	return "Other"
+}
+
 // ListInventory returns all active products with inventory quantities.
 // Pass a non-empty search to filter by product title or SKU.
 func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search string) ([]InventoryItem, error) {
@@ -390,6 +443,17 @@ func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search strin
 				imageURL = p.FeaturedImage.URL
 			}
 
+			// Build the collection slice once per product — all variants share it.
+			cols := make([]Collection, 0, len(p.Collections.Edges))
+			for _, ce := range p.Collections.Edges {
+				cols = append(cols, Collection{
+					ID:     stripGID(ce.Node.ID),
+					Title:  ce.Node.Title,
+					Handle: ce.Node.Handle,
+				})
+			}
+			colType := resolveCollectionType(cols)
+
 			for _, ve := range p.Variants.Edges {
 				v := ve.Node
 
@@ -422,6 +486,8 @@ func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search strin
 					SelectedOptions: opts,
 					DisplayVariant:  resolveDisplayVariant(opts, v.Title),
 					Size:            resolveSize(opts),
+					Collections:     cols,
+					CollectionType:  colType,
 				})
 			}
 		}

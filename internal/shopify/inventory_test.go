@@ -89,18 +89,29 @@ func productsResp(hasNextPage bool, endCursor string, products []map[string]any)
 	return string(b)
 }
 
-func makeProduct(id, title string, variants []map[string]any) map[string]any {
+// makeProductWithCollections builds a fake product node that includes a collections block.
+func makeProductWithCollections(id, title string, variants []map[string]any, collections []map[string]any) map[string]any {
 	varEdges := make([]map[string]any, len(variants))
 	for i, v := range variants {
 		varEdges[i] = map[string]any{"node": v}
 	}
+	colEdges := make([]map[string]any, len(collections))
+	for i, c := range collections {
+		colEdges[i] = map[string]any{"node": c}
+	}
 	return map[string]any{
-		"id":    id,
-		"title": title,
-		"status": "ACTIVE",
+		"id":            id,
+		"title":         title,
+		"status":        "ACTIVE",
 		"featuredImage": map[string]any{"url": "https://cdn.shopify.com/image.jpg"},
+		"collections":   map[string]any{"edges": colEdges},
 		"variants":      map[string]any{"edges": varEdges},
 	}
+}
+
+// makeProduct builds a fake product node with no collections (backward-compatible helper).
+func makeProduct(id, title string, variants []map[string]any) map[string]any {
+	return makeProductWithCollections(id, title, variants, nil)
 }
 
 // makeVariantFull builds a fake variant node with title, selectedOptions, and inventory.
@@ -542,4 +553,86 @@ func TestVariantMatchesSearch(t *testing.T) {
 	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "FOREST-12"))
 	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "Forest")) // option value
 	assert.False(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "moon"))
+}
+
+// ─── resolveCollectionType tests ──────────────────────────────────────────────
+
+func TestResolveCollectionType_KnownCollection(t *testing.T) {
+	for _, title := range []string{"Mộc Wear", "Mộc Care", "Mộc Figure", "Mộc Charm", "Mộc Living"} {
+		cols := []Collection{{ID: "1", Title: title, Handle: "moc-x"}}
+		assert.Equal(t, title, resolveCollectionType(cols), "expected %q", title)
+	}
+}
+
+func TestResolveCollectionType_Priority(t *testing.T) {
+	// When a product belongs to multiple recognised collections, the first in
+	// mocCollectionPriority wins (Mộc Wear before Mộc Charm).
+	cols := []Collection{
+		{Title: "Mộc Charm"},
+		{Title: "Mộc Wear"},
+	}
+	assert.Equal(t, "Mộc Wear", resolveCollectionType(cols))
+}
+
+func TestResolveCollectionType_Other(t *testing.T) {
+	assert.Equal(t, "Other", resolveCollectionType(nil))
+	assert.Equal(t, "Other", resolveCollectionType([]Collection{{Title: "Sale"}}))
+}
+
+func TestResolveCollectionType_CaseInsensitive(t *testing.T) {
+	cols := []Collection{{Title: "mộc charm"}}
+	assert.Equal(t, "mộc charm", resolveCollectionType(cols))
+}
+
+// ─── ListInventory collection integration tests ───────────────────────────────
+
+func TestListInventory_Collections(t *testing.T) {
+	cols := []map[string]any{
+		{"id": "gid://shopify/Collection/10", "title": "Mộc Charm", "handle": "moc-charm"},
+	}
+	product := makeProductWithCollections(
+		"gid://shopify/Product/1",
+		"Moon Charm",
+		[]map[string]any{makeVariant("MOON-001", "gid://shopify/InventoryItem/123", 5)},
+		cols,
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(productsResp(false, "", []map[string]any{product})))
+	}))
+	defer server.Close()
+
+	client := newClientForTest(&http.Client{Transport: &redirectTransport{server.URL}}, "gid://shopify/Location/1")
+
+	items, err := client.ListInventory(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	item := items[0]
+	require.Len(t, item.Collections, 1)
+	assert.Equal(t, "10", item.Collections[0].ID) // GID stripped
+	assert.Equal(t, "Mộc Charm", item.Collections[0].Title)
+	assert.Equal(t, "moc-charm", item.Collections[0].Handle)
+	assert.Equal(t, "Mộc Charm", item.CollectionType)
+}
+
+func TestListInventory_NoCollections_ReturnsOther(t *testing.T) {
+	product := makeProduct(
+		"gid://shopify/Product/2",
+		"Mystery Item",
+		[]map[string]any{makeVariant("MYS-001", "gid://shopify/InventoryItem/999", 1)},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(productsResp(false, "", []map[string]any{product})))
+	}))
+	defer server.Close()
+
+	client := newClientForTest(&http.Client{Transport: &redirectTransport{server.URL}}, "gid://shopify/Location/1")
+
+	items, err := client.ListInventory(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Empty(t, items[0].Collections)
+	assert.Equal(t, "Other", items[0].CollectionType)
 }
