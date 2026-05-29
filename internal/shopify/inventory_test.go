@@ -103,9 +103,9 @@ func makeProduct(id, title string, variants []map[string]any) map[string]any {
 	}
 }
 
-// makeVariant builds a fake variant node using the inventoryLevel(locationId:) shape.
+// makeVariantFull builds a fake variant node with title, selectedOptions, and inventory.
 // Pass qty=-1 to simulate a variant not stocked at the queried location (null level).
-func makeVariant(sku, invItemGID string, qty int) map[string]any {
+func makeVariantFull(sku, variantTitle, invItemGID string, qty int, opts []map[string]any) map[string]any {
 	var invLevel any
 	if qty >= 0 {
 		invLevel = map[string]any{
@@ -113,15 +113,25 @@ func makeVariant(sku, invItemGID string, qty int) map[string]any {
 				{"name": "available", "quantity": qty},
 			},
 		}
-	} // nil → JSON null → InventoryLevel pointer is nil in the parsed struct
-
+	}
+	if opts == nil {
+		opts = []map[string]any{}
+	}
 	return map[string]any{
-		"sku": sku,
+		"sku":             sku,
+		"title":           variantTitle,
+		"selectedOptions": opts,
 		"inventoryItem": map[string]any{
 			"id":             invItemGID,
 			"inventoryLevel": invLevel,
 		},
 	}
+}
+
+// makeVariant is a convenience wrapper around makeVariantFull for tests that
+// don't care about variant title or options (backward-compatible helper).
+func makeVariant(sku, invItemGID string, qty int) map[string]any {
+	return makeVariantFull(sku, "", invItemGID, qty, nil)
 }
 
 func setQuantitiesResp(userErrors []map[string]any) string {
@@ -237,11 +247,98 @@ func TestListInventory_WithSearch(t *testing.T) {
 	assert.Empty(t, items)
 
 	require.NotNil(t, capturedVars)
+	// Text filtering is client-side; the Shopify query always uses status:ACTIVE only.
 	queryStr, _ := capturedVars["query"].(string)
-	assert.Contains(t, queryStr, "moon")
-	assert.Contains(t, queryStr, "status:ACTIVE")
+	assert.Equal(t, "status:ACTIVE", queryStr)
 	// locationId must be passed so the query filters to the correct location.
 	assert.Equal(t, "gid://shopify/Location/1", capturedVars["locationId"])
+}
+
+func TestListInventory_VariantOptions(t *testing.T) {
+	opts := []map[string]any{
+		{"name": "Size", "value": "12mm"},
+		{"name": "Color", "value": "Forest"},
+	}
+	product := makeProduct(
+		"gid://shopify/Product/1",
+		"Forest Bracelet",
+		[]map[string]any{makeVariantFull("FOREST-12", "12mm", "gid://shopify/InventoryItem/1", 8, opts)},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(productsResp(false, "", []map[string]any{product})))
+	}))
+	defer server.Close()
+
+	client := newClientForTest(&http.Client{Transport: &redirectTransport{server.URL}}, "gid://shopify/Location/1")
+
+	items, err := client.ListInventory(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	item := items[0]
+	assert.Equal(t, "Forest Bracelet", item.Title)
+	assert.Equal(t, "12mm", item.VariantTitle)
+	assert.Equal(t, "FOREST-12", item.SKU)
+	assert.Equal(t, 8, item.Quantity)
+	require.Len(t, item.SelectedOptions, 2)
+	assert.Equal(t, "Size", item.SelectedOptions[0].Name)
+	assert.Equal(t, "12mm", item.SelectedOptions[0].Value)
+	assert.Equal(t, "Color", item.SelectedOptions[1].Name)
+	assert.Equal(t, "Forest", item.SelectedOptions[1].Value)
+	assert.Equal(t, "12mm", item.DisplayVariant) // Size wins
+	assert.Equal(t, "12mm", item.Size)
+}
+
+func TestListInventory_SearchMatchesOptionValue(t *testing.T) {
+	opts12 := []map[string]any{{"name": "Size", "value": "12mm"}}
+	opts8 := []map[string]any{{"name": "Size", "value": "8mm"}}
+	product := makeProduct(
+		"gid://shopify/Product/1",
+		"Forest Bracelet",
+		[]map[string]any{
+			makeVariantFull("FOREST-12", "12mm", "gid://shopify/InventoryItem/1", 8, opts12),
+			makeVariantFull("FOREST-8", "8mm", "gid://shopify/InventoryItem/2", 5, opts8),
+		},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(productsResp(false, "", []map[string]any{product})))
+	}))
+	defer server.Close()
+
+	client := newClientForTest(&http.Client{Transport: &redirectTransport{server.URL}}, "gid://shopify/Location/1")
+
+	// Search "12mm" — only the 12mm variant should be returned.
+	items, err := client.ListInventory(context.Background(), "12mm")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "12mm", items[0].Size)
+	assert.Equal(t, "FOREST-12", items[0].SKU)
+}
+
+func TestListInventory_SearchMatchesProductTitle(t *testing.T) {
+	opts := []map[string]any{{"name": "Size", "value": "12mm"}}
+	product := makeProduct(
+		"gid://shopify/Product/1",
+		"Moon Charm",
+		[]map[string]any{
+			makeVariantFull("MOON-12", "12mm", "gid://shopify/InventoryItem/1", 3, opts),
+			makeVariantFull("MOON-8", "8mm", "gid://shopify/InventoryItem/2", 7, []map[string]any{{"name": "Size", "value": "8mm"}}),
+		},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(productsResp(false, "", []map[string]any{product})))
+	}))
+	defer server.Close()
+
+	client := newClientForTest(&http.Client{Transport: &redirectTransport{server.URL}}, "gid://shopify/Location/1")
+
+	// Searching the product title returns ALL variants of that product.
+	items, err := client.ListInventory(context.Background(), "moon")
+	require.NoError(t, err)
+	assert.Len(t, items, 2)
 }
 
 func TestListInventory_NullInventoryLevel(t *testing.T) {
@@ -404,8 +501,45 @@ func TestToGID(t *testing.T) {
 }
 
 func TestBuildSearchQuery(t *testing.T) {
+	// buildSearchQuery always returns status:ACTIVE — text filtering is applied
+	// client-side in ListInventory so that variant title and option value searches work.
 	assert.Equal(t, "status:ACTIVE", buildSearchQuery(""))
-	q := buildSearchQuery("moon")
-	assert.Contains(t, q, "status:ACTIVE")
-	assert.Contains(t, q, "moon")
+	assert.Equal(t, "status:ACTIVE", buildSearchQuery("moon"))
+	assert.Equal(t, "status:ACTIVE", buildSearchQuery("12mm"))
+}
+
+func TestResolveDisplayVariant(t *testing.T) {
+	opts := func(pairs ...string) []SelectedOption {
+		out := make([]SelectedOption, 0, len(pairs)/2)
+		for i := 0; i+1 < len(pairs); i += 2 {
+			out = append(out, SelectedOption{Name: pairs[i], Value: pairs[i+1]})
+		}
+		return out
+	}
+	assert.Equal(t, "12mm", resolveDisplayVariant(opts("Size", "12mm"), "12mm"))
+	assert.Equal(t, "Red", resolveDisplayVariant(opts("Color", "Red"), "Red"))
+	// Size wins over Color.
+	assert.Equal(t, "12mm", resolveDisplayVariant(opts("Color", "Red", "Size", "12mm"), "12mm / Red"))
+	// Falls back to variant title when no Size/Color option.
+	assert.Equal(t, "Default Title", resolveDisplayVariant(opts("Title", "Default Title"), "Default Title"))
+	// Empty variant title → empty string.
+	assert.Equal(t, "", resolveDisplayVariant(nil, ""))
+}
+
+func TestResolveSize(t *testing.T) {
+	assert.Equal(t, "12mm", resolveSize([]SelectedOption{{Name: "Size", Value: "12mm"}}))
+	// Case-insensitive name match.
+	assert.Equal(t, "L", resolveSize([]SelectedOption{{Name: "size", Value: "L"}}))
+	assert.Equal(t, "", resolveSize([]SelectedOption{{Name: "Color", Value: "Red"}}))
+	assert.Equal(t, "", resolveSize(nil))
+}
+
+func TestVariantMatchesSearch(t *testing.T) {
+	opts := []SelectedOption{{Name: "Size", Value: "12mm"}, {Name: "Color", Value: "Forest"}}
+	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, ""))
+	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "forest"))
+	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "12mm"))
+	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "FOREST-12"))
+	assert.True(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "Forest")) // option value
+	assert.False(t, variantMatchesSearch("Forest Bracelet", "12mm", "FOREST-12", opts, "moon"))
 }

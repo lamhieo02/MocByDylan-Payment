@@ -11,13 +11,28 @@ import (
 	"strings"
 )
 
+// SelectedOption is a single Shopify variant option (e.g. {Name:"Size", Value:"12mm"}).
+type SelectedOption struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 // InventoryItem represents a product variant with its current available quantity.
+// New fields (variantTitle, selectedOptions, displayVariant, size) are additive;
+// existing fields are unchanged for backward compatibility.
 type InventoryItem struct {
+	// Existing fields — unchanged.
 	InventoryItemID string `json:"inventoryItemId"`
-	Title           string `json:"title"`
+	Title           string `json:"title"` // product title
 	SKU             string `json:"sku"`
 	Image           string `json:"image"`
 	Quantity        int    `json:"quantity"`
+
+	// New fields — added to support variant-level display and search.
+	VariantTitle    string           `json:"variantTitle"`
+	SelectedOptions []SelectedOption `json:"selectedOptions"`
+	DisplayVariant  string           `json:"displayVariant"` // Size > Color > VariantTitle > ""
+	Size            string           `json:"size"`           // shortcut for the Size option value
 }
 
 // ShopifyClient is the abstraction for inventory operations against Shopify Admin GraphQL.
@@ -212,6 +227,11 @@ query ListInventory($query: String, $cursor: String, $locationId: ID!) {
           edges {
             node {
               sku
+              title
+              selectedOptions {
+                name
+                value
+              }
               inventoryItem {
                 id
                 inventoryLevel(locationId: $locationId) {
@@ -247,9 +267,14 @@ type gqlProductsResponse struct {
 				Variants struct {
 					Edges []struct {
 						Node struct {
-							SKU           string `json:"sku"`
+							SKU   string `json:"sku"`
+							Title string `json:"title"`
+							SelectedOptions []struct {
+								Name  string `json:"name"`
+								Value string `json:"value"`
+							} `json:"selectedOptions"`
 							InventoryItem struct {
-								ID             string `json:"id"`
+								ID string `json:"id"`
 								// InventoryLevel is nil when the item is not stocked at this location.
 								InventoryLevel *struct {
 									Quantities []struct {
@@ -266,14 +291,66 @@ type gqlProductsResponse struct {
 	} `json:"products"`
 }
 
-// buildSearchQuery constructs a Shopify product search query string.
-func buildSearchQuery(search string) string {
-	base := "status:ACTIVE"
+// buildSearchQuery returns the Shopify product filter used in ListInventory.
+// All text matching (title, variant title, SKU, option values) is applied
+// client-side by variantMatchesSearch so that option-value searches like
+// "12mm" correctly find variants whose product title contains no such term.
+func buildSearchQuery(_ string) string {
+	return "status:ACTIVE"
+}
+
+// variantMatchesSearch reports whether a variant should be included in results
+// for the given search term. A variant is included when the term appears
+// (case-insensitive, substring) in any of:
+//   - product title
+//   - variant title
+//   - variant SKU
+//   - any selected option value
+//
+// An empty search matches every variant.
+func variantMatchesSearch(productTitle, variantTitle, sku string, opts []SelectedOption, search string) bool {
 	if search == "" {
-		return base
+		return true
 	}
-	s := strings.ReplaceAll(search, `"`, ``)
-	return fmt.Sprintf(`%s AND (title:*%s* OR sku:*%s*)`, base, s, s)
+	s := strings.ToLower(strings.TrimSpace(search))
+	if strings.Contains(strings.ToLower(productTitle), s) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(variantTitle), s) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(sku), s) {
+		return true
+	}
+	for _, opt := range opts {
+		if strings.Contains(strings.ToLower(opt.Value), s) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveDisplayVariant returns the most useful short label for a variant.
+// Priority: Size option → Color option → variant title → "".
+func resolveDisplayVariant(opts []SelectedOption, variantTitle string) string {
+	for _, priority := range []string{"Size", "Color"} {
+		for _, opt := range opts {
+			if strings.EqualFold(opt.Name, priority) && opt.Value != "" {
+				return opt.Value
+			}
+		}
+	}
+	return variantTitle
+}
+
+// resolveSize returns the value of the Size option, or "" when absent.
+func resolveSize(opts []SelectedOption) string {
+	for _, opt := range opts {
+		if strings.EqualFold(opt.Name, "Size") {
+			return opt.Value
+		}
+	}
+	return ""
 }
 
 // ListInventory returns all active products with inventory quantities.
@@ -316,6 +393,15 @@ func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search strin
 			for _, ve := range p.Variants.Edges {
 				v := ve.Node
 
+				opts := make([]SelectedOption, len(v.SelectedOptions))
+				for i, o := range v.SelectedOptions {
+					opts[i] = SelectedOption{Name: o.Name, Value: o.Value}
+				}
+
+				if !variantMatchesSearch(p.Title, v.Title, v.SKU, opts, search) {
+					continue
+				}
+
 				quantity := 0
 				if v.InventoryItem.InventoryLevel != nil {
 					for _, q := range v.InventoryItem.InventoryLevel.Quantities {
@@ -332,6 +418,10 @@ func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search strin
 					SKU:             v.SKU,
 					Image:           imageURL,
 					Quantity:        quantity,
+					VariantTitle:    v.Title,
+					SelectedOptions: opts,
+					DisplayVariant:  resolveDisplayVariant(opts, v.Title),
+					Size:            resolveSize(opts),
 				})
 			}
 		}
