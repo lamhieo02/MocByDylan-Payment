@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
@@ -143,6 +144,28 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		addrLastName = firstName
 	}
 
+	// Shipping fee = PayOS transfer amount − sum of line item prices.
+	// PayOS receives the exact amount the customer transferred, which already
+	// includes the shipping fee baked in by the storefront.
+	var lineSubtotalVND int64
+	for _, it := range payload.LineItems {
+		lineSubtotalVND += (it.Price / 100) * int64(it.Quantity)
+	}
+	shippingFeeVND := data.Amount - lineSubtotalVND
+	if shippingFeeVND < 0 {
+		shippingFeeVND = 0
+	}
+
+	// Extract the city/province from the last comma-separated segment of the
+	// address string (format: "street, ward, province").
+	shippingCity := ""
+	if payload.ShippingAddress != "" {
+		parts := strings.Split(payload.ShippingAddress, ", ")
+		if len(parts) > 0 {
+			shippingCity = strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+
 	var shippingAddr *shopify.ShippingAddress
 	if payload.ShippingAddress != "" {
 		shippingAddr = &shopify.ShippingAddress{
@@ -150,6 +173,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 			LastName:    addrLastName,
 			Phone:       payload.BuyerPhone,
 			Address1:    payload.ShippingAddress,
+			City:        shippingCity,
 			Country:     "Vietnam",
 			CountryCode: "VN",
 		}
@@ -182,6 +206,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 			Tags:                   "payos,qr-transfer",
 			SendReceipt:            false,
 			SendFulfillmentReceipt: false,
+			ShippingFeeVND:         shippingFeeVND,
 		},
 	}
 

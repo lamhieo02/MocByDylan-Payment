@@ -72,6 +72,9 @@ type OrderBody struct {
 	Tags                   string           `json:"tags,omitempty"`
 	SendReceipt            bool             `json:"send_receipt"`
 	SendFulfillmentReceipt bool             `json:"send_fulfillment_receipt"`
+	// ShippingFeeVND is the shipping fee in VND derived from PayOS amount − line subtotal.
+	// It is ignored by the REST CreateOrder (json:"-") and used only by CreateOrderGQL.
+	ShippingFeeVND int64 `json:"-"`
 }
 
 // OrderResponse holds the created order fields we return to the frontend.
@@ -308,8 +311,15 @@ type gqlAddressInput struct {
 	FirstName   string `json:"firstName,omitempty"`
 	LastName    string `json:"lastName,omitempty"`
 	Address1    string `json:"address1,omitempty"`
+	City        string `json:"city,omitempty"`
 	Phone       string `json:"phone,omitempty"`
 	CountryCode string `json:"countryCode,omitempty"`
+}
+
+// gqlShippingLineInput adds a shipping cost line to the Shopify order.
+type gqlShippingLineInput struct {
+	Title    string           `json:"title"`
+	PriceSet gqlMoneyBagInput `json:"priceSet"`
 }
 
 // gqlCustomerUpsertInput identifies a customer by email only.
@@ -329,25 +339,30 @@ type gqlCustomerInput struct {
 }
 
 type gqlLineItemInput struct {
-	VariantID string `json:"variantId"` // GID: "gid://shopify/ProductVariant/{id}"
-	Quantity  int    `json:"quantity"`
+	VariantID        string `json:"variantId"`        // GID: "gid://shopify/ProductVariant/{id}"
+	Quantity         int    `json:"quantity"`
+	RequiresShipping bool   `json:"requiresShipping"` // explicit true overrides variant default
 }
 
 type gqlOrderInput struct {
-	LineItems       []gqlLineItemInput    `json:"lineItems"`
-	Customer        *gqlCustomerInput     `json:"customer,omitempty"`
-	ShippingAddress *gqlAddressInput      `json:"shippingAddress,omitempty"`
-	BillingAddress  *gqlAddressInput      `json:"billingAddress,omitempty"`
-	FinancialStatus string                `json:"financialStatus,omitempty"` // must be UPPER_CASE
-	Transactions    []gqlTransactionInput `json:"transactions,omitempty"`
-	Note            string                `json:"note,omitempty"`
-	Tags            []string              `json:"tags,omitempty"`
-	Currency        string                `json:"currency,omitempty"`
+	LineItems       []gqlLineItemInput     `json:"lineItems"`
+	Customer        *gqlCustomerInput      `json:"customer,omitempty"`
+	ShippingAddress *gqlAddressInput       `json:"shippingAddress,omitempty"`
+	BillingAddress  *gqlAddressInput       `json:"billingAddress,omitempty"`
+	FinancialStatus string                 `json:"financialStatus,omitempty"` // must be UPPER_CASE
+	Transactions    []gqlTransactionInput  `json:"transactions,omitempty"`
+	ShippingLines   []gqlShippingLineInput `json:"shippingLines,omitempty"`
+	Note            string                 `json:"note,omitempty"`
+	Tags            []string               `json:"tags,omitempty"`
+	Currency        string                 `json:"currency,omitempty"`
 }
 
 type gqlOptionsInput struct {
-	SendReceipt            bool `json:"sendReceipt"`
-	SendFulfillmentReceipt bool `json:"sendFulfillmentReceipt"`
+	// InventoryBehaviour controls how inventory is adjusted when the order is created.
+	// DECREMENT_OBEYING_POLICY respects the variant's inventory management settings.
+	InventoryBehaviour     string `json:"inventoryBehaviour,omitempty"`
+	SendReceipt            bool   `json:"sendReceipt"`
+	SendFulfillmentReceipt bool   `json:"sendFulfillmentReceipt"`
 }
 
 // orderCreateMutation is the GraphQL mutation sent to /admin/api/{version}/graphql.json.
@@ -395,11 +410,16 @@ type orderCreateResponseData struct {
 //   - customer uses toUpsert matched by email only (phone excluded to avoid uniqueness conflicts)
 func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 	// Line items → GID format.
+	// RequiresShipping: true is set explicitly so Shopify treats every item as a
+	// physical product regardless of the variant's default setting. Without this,
+	// Shopify may inherit requires_shipping=false from the variant, which silently
+	// suppresses the shipping address, shipping lines, and inventory deduction.
 	gqlItems := make([]gqlLineItemInput, 0, len(req.Order.LineItems))
 	for _, li := range req.Order.LineItems {
 		gqlItems = append(gqlItems, gqlLineItemInput{
-			VariantID: fmt.Sprintf("gid://shopify/ProductVariant/%d", li.VariantID),
-			Quantity:  li.Quantity,
+			VariantID:        fmt.Sprintf("gid://shopify/ProductVariant/%d", li.VariantID),
+			Quantity:         li.Quantity,
+			RequiresShipping: true,
 		})
 	}
 
@@ -427,6 +447,7 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 			FirstName:   a.FirstName,
 			LastName:    a.LastName,
 			Address1:    a.Address1,
+			City:        a.City,
 			Phone:       a.Phone,
 			CountryCode: a.CountryCode,
 		}
@@ -455,6 +476,21 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 		}
 	}
 
+	// Shipping line: PayOS amount is the exact amount transferred by the customer.
+	// If it exceeds the sum of line item prices, the difference is the shipping fee.
+	var shippingLines []gqlShippingLineInput
+	if req.Order.ShippingFeeVND > 0 {
+		shippingLines = []gqlShippingLineInput{{
+			Title: "Phí vận chuyển",
+			PriceSet: gqlMoneyBagInput{
+				ShopMoney: gqlMoneyInput{
+					Amount:       fmt.Sprintf("%d", req.Order.ShippingFeeVND),
+					CurrencyCode: "VND",
+				},
+			},
+		}}
+	}
+
 	variables := map[string]any{
 		"order": gqlOrderInput{
 			LineItems:       gqlItems,
@@ -463,11 +499,13 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 			BillingAddress:  toGQLAddr(req.Order.BillingAddress),
 			FinancialStatus: strings.ToUpper(req.Order.FinancialStatus),
 			Transactions:    gqlTxns,
+			ShippingLines:   shippingLines,
 			Note:            req.Order.Note,
 			Tags:            tags,
 			Currency:        "VND",
 		},
 		"options": gqlOptionsInput{
+			InventoryBehaviour:     "DECREMENT_OBEYING_POLICY",
 			SendReceipt:            req.Order.SendReceipt,
 			SendFulfillmentReceipt: req.Order.SendFulfillmentReceipt,
 		},
