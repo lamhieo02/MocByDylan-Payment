@@ -86,21 +86,17 @@ func GetCartPayload(key string) (*CartPayload, error) {
 	return &payload, nil
 }
 
-// MarkProcessed sets a flag key so duplicate webhooks are ignored. TTL: 24h.
-func MarkProcessed(paymentLinkID string) error {
-	return rdb.Set(context.Background(), "processed:"+paymentLinkID, "1", 24*time.Hour).Err()
-}
-
-// IsProcessed returns true when the paymentLinkId has already been handled.
-func IsProcessed(paymentLinkID string) (bool, error) {
-	val, err := rdb.Get(context.Background(), "processed:"+paymentLinkID).Result()
-	if errors.Is(err, redis.Nil) {
-		return false, nil
-	}
+// TryMarkProcessed atomically claims the processing right for a paymentLinkId.
+// It uses Redis SET NX (set-if-not-exists) so the operation is atomic — only
+// one concurrent caller receives claimed=true and should proceed. Any subsequent
+// caller (duplicate webhook delivery, retry) receives claimed=false and must skip.
+// TTL: 24h, consistent with the previous MarkProcessed behaviour.
+func TryMarkProcessed(paymentLinkID string) (claimed bool, err error) {
+	ok, err := rdb.SetNX(context.Background(), "processed:"+paymentLinkID, "1", 24*time.Hour).Result()
 	if err != nil {
-		return false, fmt.Errorf("kv: GET processed:%s: %w", paymentLinkID, err)
+		return false, fmt.Errorf("kv: SetNX processed:%s: %w", paymentLinkID, err)
 	}
-	return val != "", nil
+	return ok, nil
 }
 
 // Ping checks connectivity to Redis (used by health checks).

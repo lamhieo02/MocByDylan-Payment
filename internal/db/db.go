@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -180,6 +181,70 @@ func UpdateOrderFailed(paymentLinkID, errMsg string) error {
 		return fmt.Errorf("db: update order failed: %w", err)
 	}
 	return nil
+}
+
+// CartPayloadRecord contains the buyer and line-item data persisted at
+// payment-link creation time. It is returned by GetCartPayload when the
+// Redis cache (20-min TTL) has already expired by the time the webhook arrives.
+// The caller is responsible for unmarshalling LineItemsJSON.
+type CartPayloadRecord struct {
+	OrderCode       int64
+	Amount          int64
+	BuyerName       string
+	BuyerEmail      string
+	BuyerPhone      string
+	ShippingAddress string
+	LineItemsJSON   []byte // raw JSONB — unmarshal into []kv.LineItem in the caller
+}
+
+// GetCartPayload fetches the stored order payload from PostgreSQL by paymentLinkId.
+// Returns nil, nil when no matching row exists.
+// Returns nil, nil when the database is not configured (DATABASE_URL unset).
+func GetCartPayload(paymentLinkID string) (*CartPayloadRecord, error) {
+	if pool == nil {
+		return nil, nil
+	}
+
+	var rec CartPayloadRecord
+	var buyerName, buyerEmail, buyerPhone, shippingAddress *string
+	var lineItemsJSON []byte
+
+	err := pool.QueryRow(context.Background(), `
+		SELECT order_code, amount, buyer_name, buyer_email, buyer_phone,
+		       shipping_address, line_items
+		FROM orders
+		WHERE payment_link_id = $1
+	`, paymentLinkID).Scan(
+		&rec.OrderCode,
+		&rec.Amount,
+		&buyerName,
+		&buyerEmail,
+		&buyerPhone,
+		&shippingAddress,
+		&lineItemsJSON,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("db: GetCartPayload %s: %w", paymentLinkID, err)
+	}
+
+	if buyerName != nil {
+		rec.BuyerName = *buyerName
+	}
+	if buyerEmail != nil {
+		rec.BuyerEmail = *buyerEmail
+	}
+	if buyerPhone != nil {
+		rec.BuyerPhone = *buyerPhone
+	}
+	if shippingAddress != nil {
+		rec.ShippingAddress = *shippingAddress
+	}
+	rec.LineItemsJSON = lineItemsJSON
+
+	return &rec, nil
 }
 
 // Ping checks DB connectivity (health). Fails if DATABASE_URL is unset.

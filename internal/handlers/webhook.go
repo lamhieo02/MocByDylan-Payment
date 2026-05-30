@@ -80,28 +80,48 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	processed, err := kv.IsProcessed(data.PaymentLinkID)
+	// Atomically claim the processing right before touching any external system.
+	// Redis SET NX guarantees only one concurrent handler proceeds — eliminating
+	// the race window that existed when the flag was set at the end of the handler.
+	claimed, err := kv.TryMarkProcessed(data.PaymentLinkID)
 	if err != nil {
-		fmt.Printf("[webhook] KV IsProcessed error: %v\n", err)
+		fmt.Printf("[webhook] TryMarkProcessed error for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if processed {
+	if !claimed {
 		fmt.Printf("[webhook] duplicate event for paymentLinkId=%s, skipping\n", data.PaymentLinkID)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	payload, err := kv.GetCartPayload(data.PaymentLinkID)
-	if err != nil || payload == nil {
-		fmt.Printf("[webhook] no KV payload for paymentLinkId=%s, building minimal order\n", data.PaymentLinkID)
-		// payload = &kv.CartPayload{
-		// 	OrderCode:  data.OrderCode,
-		// 	Amount:     data.Amount,
-		// 	BuyerEmail: "",
-		// }
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	if err != nil {
+		fmt.Printf("[webhook] KV error for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+	}
+	if payload == nil {
+		// Redis TTL (20 min) may have expired before the webhook arrived.
+		// Fall back to PostgreSQL which has the same data persisted at link-creation time.
+		fmt.Printf("[webhook] Redis miss for paymentLinkId=%s — trying DB fallback\n", data.PaymentLinkID)
+		dbRec, dbErr := db.GetCartPayload(data.PaymentLinkID)
+		if dbErr != nil {
+			fmt.Printf("[webhook] DB fallback error for paymentLinkId=%s: %v\n", data.PaymentLinkID, dbErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if dbRec == nil {
+			fmt.Printf("[webhook] no cart data found (redis+db miss) for paymentLinkId=%s\n", data.PaymentLinkID)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		converted, convErr := cartPayloadFromDB(dbRec)
+		if convErr != nil {
+			fmt.Printf("[webhook] DB record conversion error for paymentLinkId=%s: %v\n", data.PaymentLinkID, convErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		payload = converted
+		fmt.Printf("[webhook] using DB fallback payload for paymentLinkId=%s\n", data.PaymentLinkID)
 	}
 
 	// validate payload
@@ -172,10 +192,10 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	var shopifyErrMsg string
 	var dbNote string
 
-	created, shopifyErr := shopify.CreateOrder(orderReq)
+	created, shopifyErr := shopify.CreateOrderGQL(orderReq)
 	if shopifyErr != nil {
-		// Nice-to-have: payment is already successful — DB is source of truth for fulfillment.
-		fmt.Printf("[webhook] Shopify CreateOrder failed (bypass) paymentLinkId=%s: %v\n", data.PaymentLinkID, shopifyErr)
+		// Payment is already successful — DB is source of truth for fulfillment.
+		fmt.Printf("[webhook] Shopify CreateOrderGQL failed (bypass) paymentLinkId=%s: %v\n", data.PaymentLinkID, shopifyErr)
 		shopifyErrMsg = shopifyErr.Error()
 		dbNote = "shopify CreateOrder: " + shopifyErr.Error()
 	} else {
@@ -237,11 +257,27 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		LineItems:           mailItems,
 	})
 
-	if err := kv.MarkProcessed(data.PaymentLinkID); err != nil {
-		fmt.Printf("[webhook] KV MarkProcessed error: %v\n", err)
-	}
-
 	w.WriteHeader(http.StatusOK)
+}
+
+// cartPayloadFromDB converts a db.CartPayloadRecord (PostgreSQL fallback) into the
+// kv.CartPayload structure expected by the rest of the webhook handler.
+func cartPayloadFromDB(rec *db.CartPayloadRecord) (*kv.CartPayload, error) {
+	var items []kv.LineItem
+	if len(rec.LineItemsJSON) > 0 {
+		if err := json.Unmarshal(rec.LineItemsJSON, &items); err != nil {
+			return nil, fmt.Errorf("unmarshal line_items from db: %w", err)
+		}
+	}
+	return &kv.CartPayload{
+		OrderCode:       rec.OrderCode,
+		Amount:          rec.Amount,
+		BuyerName:       rec.BuyerName,
+		BuyerEmail:      rec.BuyerEmail,
+		BuyerPhone:      rec.BuyerPhone,
+		ShippingAddress: rec.ShippingAddress,
+		LineItems:       items,
+	}, nil
 }
 
 func toShopifyLineItems(items []kv.LineItem) []shopify.LineItem {
