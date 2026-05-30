@@ -312,15 +312,18 @@ type gqlAddressInput struct {
 	CountryCode string `json:"countryCode,omitempty"`
 }
 
+// gqlCustomerUpsertInput identifies a customer by email only.
+// Phone is intentionally excluded: Shopify enforces phone uniqueness per customer
+// and returns a userError ("phone has already been taken") if the phone belongs to
+// a different existing customer. Phone is captured separately via shippingAddress.
 type gqlCustomerUpsertInput struct {
 	Email     string `json:"email,omitempty"`
 	FirstName string `json:"firstName,omitempty"`
 	LastName  string `json:"lastName,omitempty"`
-	Phone     string `json:"phone,omitempty"`
 }
 
 // gqlCustomerInput wraps the customer in "toUpsert" so Shopify creates a new
-// customer record or merges with an existing one by email/phone match.
+// customer record or merges with an existing one matched by email.
 type gqlCustomerInput struct {
 	ToUpsert *gqlCustomerUpsertInput `json:"toUpsert,omitempty"`
 }
@@ -389,7 +392,7 @@ type orderCreateResponseData struct {
 //   - financialStatus and transaction kind/status are UPPER_CASE
 //   - transaction amount uses amountSet.shopMoney instead of a plain amount string
 //   - comma-separated tags are split into a []string
-//   - customer uses toUpsert (create-or-match by email/phone) instead of inline embed
+//   - customer uses toUpsert matched by email only (phone excluded to avoid uniqueness conflicts)
 func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 	// Line items → GID format.
 	gqlItems := make([]gqlLineItemInput, 0, len(req.Order.LineItems))
@@ -400,16 +403,17 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 		})
 	}
 
-	// Customer: toUpsert creates or merges by email/phone.
+	// Customer: only set when email is present so Shopify has a unique identifier
+	// to create-or-merge on. Without email, toUpsert has no matching key and
+	// Shopify may error. Name and phone are always captured in shippingAddress.
 	var customer *gqlCustomerInput
 	c := req.Order.Customer
-	if c.Email != "" || c.FirstName != "" || c.LastName != "" || c.Phone != "" {
+	if c.Email != "" {
 		customer = &gqlCustomerInput{
 			ToUpsert: &gqlCustomerUpsertInput{
 				Email:     c.Email,
 				FirstName: c.FirstName,
 				LastName:  c.LastName,
-				Phone:     c.Phone,
 			},
 		}
 	}
