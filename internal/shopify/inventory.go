@@ -40,6 +40,10 @@ type InventoryItem struct {
 	DisplayVariant  string           `json:"displayVariant"` // Size > Color > VariantTitle > ""
 	Size            string           `json:"size"`           // shortcut for the Size option value
 
+	// Price is the variant's selling price as a decimal string (e.g. "140000.00"),
+	// in the store's currency (VND). Formatted for display on the client.
+	Price string `json:"price"`
+
 	// Collection fields (added for dashboard collection filtering).
 	Collections    []Collection `json:"collections"`
 	CollectionType string       `json:"collectionType"` // first recognised Mộc* collection, else "Other"
@@ -247,6 +251,7 @@ query ListInventory($query: String, $cursor: String, $locationId: ID!) {
             node {
               sku
               title
+              price
               selectedOptions {
                 name
                 value
@@ -293,11 +298,12 @@ type gqlProductsResponse struct {
 					} `json:"edges"`
 				} `json:"collections"`
 				Variants struct {
-					Edges []struct {
-						Node struct {
-							SKU   string `json:"sku"`
-							Title string `json:"title"`
-							SelectedOptions []struct {
+				Edges []struct {
+					Node struct {
+						SKU   string `json:"sku"`
+						Title string `json:"title"`
+						Price string `json:"price"`
+						SelectedOptions []struct {
 								Name  string `json:"name"`
 								Value string `json:"value"`
 							} `json:"selectedOptions"`
@@ -476,19 +482,20 @@ func (c *shopifyInventoryClient) ListInventory(ctx context.Context, search strin
 					}
 				}
 
-				items = append(items, InventoryItem{
-					InventoryItemID: stripGID(v.InventoryItem.ID),
-					Title:           p.Title,
-					SKU:             v.SKU,
-					Image:           imageURL,
-					Quantity:        quantity,
-					VariantTitle:    v.Title,
-					SelectedOptions: opts,
-					DisplayVariant:  resolveDisplayVariant(opts, v.Title),
-					Size:            resolveSize(opts),
-					Collections:     cols,
-					CollectionType:  colType,
-				})
+			items = append(items, InventoryItem{
+				InventoryItemID: stripGID(v.InventoryItem.ID),
+				Title:           p.Title,
+				SKU:             v.SKU,
+				Image:           imageURL,
+				Quantity:        quantity,
+				VariantTitle:    v.Title,
+				Price:           v.Price,
+				SelectedOptions: opts,
+				DisplayVariant:  resolveDisplayVariant(opts, v.Title),
+				Size:            resolveSize(opts),
+				Collections:     cols,
+				CollectionType:  colType,
+			})
 			}
 		}
 
