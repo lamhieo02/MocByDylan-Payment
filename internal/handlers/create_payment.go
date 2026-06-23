@@ -239,7 +239,7 @@ func createDraftOrder(req createPaymentReq, paymentLinkID string) (id int64, nam
 	var shippingLine *shopify.DraftOrderShippingLine
 	if shippingFeeVND > 0 {
 		shippingLine = &shopify.DraftOrderShippingLine{
-			Title: "Phí vận chuyển",
+			Title: "Giao hàng tiêu chuẩn",
 			Price: fmt.Sprintf("%d", shippingFeeVND),
 		}
 	}

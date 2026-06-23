@@ -245,11 +245,11 @@ func CompleteDraftOrder(draftOrderID int64) (*DraftOrderResponse, error) {
 // ─── GraphQL draftOrderComplete ───────────────────────────────────────────────
 
 // draftOrderCompleteMutation completes a draft order and returns the resulting
-// Shopify order. The order email and name are requested so we can log the
-// address Shopify sends the Order Confirmation email to.
+// Shopify order. The optional $paymentGatewayId sets the customer-facing payment
+// method label (e.g. "Thanh toán QR"). Without it Shopify defaults to "Manual".
 const draftOrderCompleteMutation = `
-mutation draftOrderComplete($id: ID!) {
-  draftOrderComplete(id: $id) {
+mutation draftOrderComplete($id: ID!, $paymentGatewayId: ID) {
+  draftOrderComplete(id: $id, paymentGatewayId: $paymentGatewayId) {
     userErrors {
       field
       message
@@ -290,12 +290,21 @@ type draftOrderCompleteResponseData struct {
 // (draftOrderComplete mutation). It converts the draft order into a paid regular
 // order and returns the resulting order details as an OrderResponse.
 //
+// paymentGatewayID is the GID of a Shopify payment gateway
+// (e.g. "gid://shopify/PaymentGateway/12345678"). When set, Shopify records the
+// payment against that gateway and the customer-facing payment method label
+// (Customer Accounts page) shows the gateway's name instead of "Manual".
+// Pass an empty string to use the default "Manual" gateway.
+//
 // When the draft order was created with an email address, Shopify automatically
 // sends the Order Confirmation email to that address upon completion — no
 // additional sendReceipt flag is required.
-func CompleteDraftOrderGQL(draftOrderID int64) (*OrderResponse, error) {
+func CompleteDraftOrderGQL(draftOrderID int64, paymentGatewayID string) (*OrderResponse, error) {
 	gid := fmt.Sprintf("gid://shopify/DraftOrder/%d", draftOrderID)
 	variables := map[string]any{"id": gid}
+	if paymentGatewayID != "" {
+		variables["paymentGatewayId"] = paymentGatewayID
+	}
 
 	data, err := doGraphQL(draftOrderCompleteMutation, variables)
 	if err != nil {
@@ -331,35 +340,34 @@ func CompleteDraftOrderGQL(draftOrderID int64) (*OrderResponse, error) {
 	}, nil
 }
 
-// ─── Order Transaction ────────────────────────────────────────────────────────
+// ─── Order Note Update ────────────────────────────────────────────────────────
 
-// TransactionRequest is the REST payload for POST /orders/{id}/transactions.json.
-// Used to record the PayOS payment against the completed Shopify order.
-type TransactionRequest struct {
-	Transaction TransactionBody `json:"transaction"`
+type updateOrderNoteEnvelope struct {
+	Order struct {
+		Note string `json:"note"`
+	} `json:"order"`
 }
 
-// TransactionBody holds the payment details.
-type TransactionBody struct {
-	Kind          string `json:"kind"`          // "sale"
-	Status        string `json:"status"`        // "success"
-	Amount        string `json:"amount"`        // decimal string e.g. "350000"
-	Currency      string `json:"currency"`      // "VND"
-	Gateway       string `json:"gateway"`       // "payos"
-	Authorization string `json:"authorization"` // paymentLinkId
-}
+// UpdateOrderNote appends PayOS settlement details to the note of an existing
+// Shopify order via PUT /orders/{id}.json.
+//
+// Background: when a Draft Order is completed by Shopify (draftOrderComplete),
+// the order is already marked as paid with an internal transaction — adding a
+// second "sale" transaction via the REST transactions endpoint returns HTTP 422
+// ("sale is not a valid transaction kind"). Updating the note is the correct
+// approach: it records the PayOS reference inside Shopify's order detail page
+// without conflicting with the existing payment record.
+func UpdateOrderNote(shopifyOrderID int64, note string) error {
+	var env updateOrderNoteEnvelope
+	env.Order.Note = note
 
-// AddOrderTransaction posts a payment transaction to an existing Shopify order.
-// This records the PayOS settlement against the order created via draftOrderComplete,
-// providing a full audit trail inside Shopify's Timeline.
-func AddOrderTransaction(shopifyOrderID int64, req TransactionRequest) error {
-	body, err := json.Marshal(req)
+	body, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
 
-	url := adminURL(fmt.Sprintf("orders/%d/transactions.json", shopifyOrderID))
-	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	url := adminURL(fmt.Sprintf("orders/%d.json", shopifyOrderID))
+	httpReq, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -374,7 +382,7 @@ func AddOrderTransaction(shopifyOrderID int64, req TransactionRequest) error {
 
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("shopify: AddOrderTransaction HTTP %d: %s", resp.StatusCode, string(raw))
+		return fmt.Errorf("shopify: UpdateOrderNote HTTP %d: %s", resp.StatusCode, string(raw))
 	}
 	return nil
 }
@@ -453,10 +461,12 @@ type gqlMoneyBagInput struct {
 
 // gqlTransactionInput records the PayOS payment.
 // kind and status must be UPPER_CASE per the GraphQL schema (e.g. "SALE", "SUCCESS").
+// Gateway is the payment gateway name shown in Shopify Admin Timeline.
 type gqlTransactionInput struct {
 	Kind      string           `json:"kind"`
 	Status    string           `json:"status"`
 	AmountSet gqlMoneyBagInput `json:"amountSet"`
+	Gateway   string           `json:"gateway,omitempty"`
 }
 
 type gqlAddressInput struct {
@@ -613,6 +623,8 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 	}
 
 	// Transactions — GraphQL requires UPPER_CASE kind/status and amountSet wrapper.
+	// Gateway is forwarded so the Shopify Timeline shows "payos" as the gateway
+	// name instead of an empty label.
 	gqlTxns := make([]gqlTransactionInput, 0, len(req.Order.Transactions))
 	for _, tx := range req.Order.Transactions {
 		gqlTxns = append(gqlTxns, gqlTransactionInput{
@@ -624,6 +636,7 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 					CurrencyCode: tx.Currency,
 				},
 			},
+			Gateway: tx.Gateway,
 		})
 	}
 
@@ -640,7 +653,7 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 	var shippingLines []gqlShippingLineInput
 	if req.Order.ShippingFeeVND > 0 {
 		shippingLines = []gqlShippingLineInput{{
-			Title: "Phí vận chuyển",
+			Title: "Giao hàng tiêu chuẩn",
 			PriceSet: gqlMoneyBagInput{
 				ShopMoney: gqlMoneyInput{
 					Amount:       fmt.Sprintf("%d", req.Order.ShippingFeeVND),
@@ -707,6 +720,51 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 		FinancialStatus: result.OrderCreate.Order.DisplayFinancialStatus,
 		Email:           result.OrderCreate.Order.Email,
 	}, nil
+}
+
+// ─── Payment Gateway Lookup ───────────────────────────────────────────────────
+
+const paymentGatewaysQuery = `
+query {
+  paymentGateways {
+    id
+    name
+  }
+}`
+
+// FetchPaymentGatewayID queries Shopify Admin for all payment gateways and returns
+// the GID of the first gateway whose name matches the given name (case-insensitive).
+//
+// Usage: create a Manual Payment Method in Shopify Admin → Settings → Payments →
+// Manual Payment Methods, name it "Thanh toán QR", then call this function once to
+// get its GID and set SHOPIFY_PAYOS_GATEWAY_ID in your environment:
+//
+//	shopify.FetchPaymentGatewayID("Thanh toán QR")
+//
+// The returned GID looks like: "gid://shopify/PaymentGateway/12345678"
+func FetchPaymentGatewayID(name string) (string, error) {
+	data, err := doGraphQL(paymentGatewaysQuery, nil)
+	if err != nil {
+		return "", err
+	}
+
+	var result struct {
+		PaymentGateways []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"paymentGateways"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("shopify: cannot parse paymentGateways: %w", err)
+	}
+
+	nameLower := strings.ToLower(name)
+	for _, gw := range result.PaymentGateways {
+		if strings.ToLower(gw.Name) == nameLower {
+			return gw.ID, nil
+		}
+	}
+	return "", fmt.Errorf("shopify: payment gateway %q not found", name)
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────

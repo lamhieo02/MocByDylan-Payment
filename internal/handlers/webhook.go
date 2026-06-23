@@ -6,7 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
@@ -20,6 +22,43 @@ import (
 // waitDraftRetry is a variable so tests can replace it with a no-op to avoid
 // sleeping during unit tests.
 var waitDraftRetry = func(seconds int) { time.Sleep(time.Duration(seconds) * time.Second) }
+
+// ── Payment gateway resolution ────────────────────────────────────────────────
+// gatewayID is resolved once and cached. Resolution order:
+//  1. SHOPIFY_PAYOS_GATEWAY_ID env var (explicit GID — fastest, no API call)
+//  2. Auto-lookup by SHOPIFY_PAYOS_GATEWAY_NAME env var (default: "Bank Deposit")
+//
+// This means zero manual setup: the existing "Bank Deposit" manual payment method
+// in Shopify Admin is used automatically, and the customer-facing label in
+// Customer Accounts shows its configured name.
+var (
+	resolvedGatewayID   string
+	gatewayResolveOnce  sync.Once
+)
+
+func payosGatewayID() string {
+	gatewayResolveOnce.Do(func() {
+		// Explicit GID takes priority — no API call needed.
+		if id := os.Getenv("SHOPIFY_PAYOS_GATEWAY_ID"); id != "" {
+			resolvedGatewayID = id
+			log.Printf("[webhook] payment gateway set from SHOPIFY_PAYOS_GATEWAY_ID: %s", id)
+			return
+		}
+		// Auto-lookup by display name.
+		name := os.Getenv("SHOPIFY_PAYOS_GATEWAY_NAME")
+		if name == "" {
+			name = "Bank Deposit" // matches the existing manual payment method
+		}
+		id, err := shopify.FetchPaymentGatewayID(name)
+		if err != nil {
+			log.Printf("[webhook] WARNING: cannot resolve payment gateway %q: %v — will use Shopify default (Manual)", name, err)
+			return
+		}
+		resolvedGatewayID = id
+		log.Printf("[webhook] payment gateway %q resolved → %s", name, id)
+	})
+	return resolvedGatewayID
+}
 
 type webhookBody struct {
 	Code      string          `json:"code"`
@@ -240,7 +279,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[webhook] Draft Completion Started | DraftID=%d | DraftName=%s | PaymentLinkID=%s",
 			payload.DraftOrderID, payload.DraftOrderName, data.PaymentLinkID)
 
-		completed, completeErr := completeDraftWithRetry(payload.DraftOrderID, data.PaymentLinkID)
+		completed, completeErr := completeDraftWithRetry(payload.DraftOrderID, data.PaymentLinkID, payosGatewayID())
 		if completeErr != nil {
 			// Draft completion failed after all retries. Payment is already confirmed
 			// by PayOS — fall through to Path B (GQL fallback) to avoid a lost order.
@@ -264,22 +303,19 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 					shopifyOrderName, shopifyOrderID)
 			}
 
-			// Record the PayOS transaction against the completed order for audit trail.
-			txErr := shopify.AddOrderTransaction(shopifyOrderID, shopify.TransactionRequest{
-				Transaction: shopify.TransactionBody{
-					Kind:          "sale",
-					Status:        "success",
-					Amount:        fmt.Sprintf("%d", data.Amount),
-					Currency:      "VND",
-					Gateway:       "payos",
-					Authorization: data.PaymentLinkID,
-				},
-			})
-			if txErr != nil {
-				log.Printf("[webhook] WARNING: AddOrderTransaction failed for order %d: %v", shopifyOrderID, txErr)
-			} else {
-				log.Printf("[webhook] PayOS transaction recorded | OrderID=%d | Amount=%d | Ref=%s", shopifyOrderID, data.Amount, data.Reference)
-			}
+		// Update the order note with full PayOS settlement details.
+		// Note: adding a new "sale" transaction via REST is rejected (HTTP 422)
+		// because draftOrderComplete already records the payment internally.
+		// Updating the note is the correct audit trail for the draft-order path.
+		payosNote := fmt.Sprintf(
+			"PayOS QR transfer confirmed.\npaymentLinkId: %s\nref: %s\namount: %d VND\ntxDatetime: %s",
+			data.PaymentLinkID, data.Reference, data.Amount, data.TransactionDateTime,
+		)
+		if noteErr := shopify.UpdateOrderNote(shopifyOrderID, payosNote); noteErr != nil {
+			log.Printf("[webhook] WARNING: UpdateOrderNote failed for order %d: %v", shopifyOrderID, noteErr)
+		} else {
+			log.Printf("[webhook] PayOS note written to order | OrderID=%d | Ref=%s", shopifyOrderID, data.Reference)
+		}
 		}
 	}
 
@@ -403,7 +439,12 @@ func cartPayloadFromDB(rec *db.CartPayloadRecord) (*kv.CartPayload, error) {
 // rate-limits or network hiccups. Since the PayOS payment is already confirmed,
 // we must not give up silently — every retry keeps the order recovery window open.
 // If all retries fail, the caller falls back to CreateOrderGQL to avoid data loss.
-func completeDraftWithRetry(draftOrderID int64, paymentLinkID string) (*shopify.OrderResponse, error) {
+// completeDraftWithRetry attempts draftOrderComplete up to maxDraftRetries times.
+// paymentGatewayID is the Shopify GID of a Manual Payment Method (e.g.
+// "gid://shopify/PaymentGateway/12345678") set via SHOPIFY_PAYOS_GATEWAY_ID.
+// When non-empty, the customer-facing payment method label in Customer Accounts
+// shows the gateway name (e.g. "Thanh toán QR") instead of "Manual".
+func completeDraftWithRetry(draftOrderID int64, paymentLinkID string, paymentGatewayID string) (*shopify.OrderResponse, error) {
 	const maxDraftRetries = 10
 	// Attempts 1-3: quick backoff (2s, 5s, 10s).
 	// Attempts 4-10: fixed 25s — gives Shopify time to recover from rate-limits
@@ -412,7 +453,7 @@ func completeDraftWithRetry(draftOrderID int64, paymentLinkID string) (*shopify.
 
 	var lastErr error
 	for attempt := 1; attempt <= maxDraftRetries; attempt++ {
-		order, err := shopify.CompleteDraftOrderGQL(draftOrderID)
+		order, err := shopify.CompleteDraftOrderGQL(draftOrderID, paymentGatewayID)
 		if err == nil {
 			return order, nil
 		}
