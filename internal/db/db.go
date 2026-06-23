@@ -49,6 +49,8 @@ func migrate() error {
 			id                  SERIAL PRIMARY KEY,
 			payment_link_id     TEXT UNIQUE NOT NULL,
 			order_code          BIGINT,
+			draft_order_id      BIGINT,
+			draft_order_name    TEXT,
 			shopify_order_id    BIGINT,
 			shopify_order_name  TEXT,
 			status              TEXT        NOT NULL DEFAULT 'pending',
@@ -62,6 +64,7 @@ func migrate() error {
 			line_items          JSONB,
 			payos_reference     TEXT,
 			payos_tx_datetime   TEXT,
+			completed_at        TIMESTAMPTZ,
 			note                TEXT,
 			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -70,8 +73,11 @@ func migrate() error {
 	if err != nil {
 		return fmt.Errorf("create orders table: %w", err)
 	}
-	// Older deployments: add column if missing
+	// Additive migrations — safe to run on every startup against older deployments.
 	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS description TEXT`)
+	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS draft_order_id BIGINT`)
+	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS draft_order_name TEXT`)
+	_, _ = pool.Exec(ctx, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`)
 	log.Println("db: schema up-to-date")
 	return nil
 }
@@ -132,8 +138,8 @@ func nullIfEmpty(s string) interface{} {
 	return s
 }
 
-// UpdateOrderPaid sets status=paid and PayOS settlement fields.
-// Shopify fields: use orderID 0 and empty name when CreateOrder was skipped/failed.
+// UpdateOrderPaid sets status=paid, stamps completed_at, and records PayOS + Shopify settlement fields.
+// Shopify fields: use orderID 0 and empty name when order creation was skipped/failed.
 // If note is non-empty, it is stored (e.g. Shopify error for ops); empty string leaves note unchanged.
 func UpdateOrderPaid(paymentLinkID string, shopifyOrderID int64, shopifyOrderName, payosReference, payosTxDatetime, note string) error {
 	if pool == nil {
@@ -148,6 +154,7 @@ func UpdateOrderPaid(paymentLinkID string, shopifyOrderID int64, shopifyOrderNam
 			payos_reference    = $4,
 			payos_tx_datetime  = $5,
 			note               = COALESCE(NULLIF($6, ''), note),
+			completed_at       = NOW(),
 			updated_at         = NOW()
 		WHERE payment_link_id = $1
 	`,
@@ -183,6 +190,25 @@ func UpdateOrderFailed(paymentLinkID, errMsg string) error {
 	return nil
 }
 
+// UpdateDraftOrder stores the Shopify Draft Order ID and name against a payment link.
+// Called immediately after CreateDraftOrder succeeds in the create-payment handler.
+func UpdateDraftOrder(paymentLinkID string, draftOrderID int64, draftOrderName string) error {
+	if pool == nil {
+		return nil
+	}
+	_, err := pool.Exec(context.Background(), `
+		UPDATE orders SET
+			draft_order_id   = $2,
+			draft_order_name = $3,
+			updated_at       = NOW()
+		WHERE payment_link_id = $1
+	`, paymentLinkID, draftOrderID, draftOrderName)
+	if err != nil {
+		return fmt.Errorf("db: UpdateDraftOrder: %w", err)
+	}
+	return nil
+}
+
 // CartPayloadRecord contains the buyer and line-item data persisted at
 // payment-link creation time. It is returned by GetCartPayload when the
 // Redis cache (20-min TTL) has already expired by the time the webhook arrives.
@@ -195,6 +221,8 @@ type CartPayloadRecord struct {
 	BuyerPhone      string
 	ShippingAddress string
 	LineItemsJSON   []byte // raw JSONB — unmarshal into []kv.LineItem in the caller
+	DraftOrderID    int64  // populated after CreateDraftOrder succeeds
+	DraftOrderName  string
 }
 
 // GetCartPayload fetches the stored order payload from PostgreSQL by paymentLinkId.
@@ -206,12 +234,13 @@ func GetCartPayload(paymentLinkID string) (*CartPayloadRecord, error) {
 	}
 
 	var rec CartPayloadRecord
-	var buyerName, buyerEmail, buyerPhone, shippingAddress *string
+	var buyerName, buyerEmail, buyerPhone, shippingAddress, draftOrderName *string
 	var lineItemsJSON []byte
+	var draftOrderID *int64
 
 	err := pool.QueryRow(context.Background(), `
 		SELECT order_code, amount, buyer_name, buyer_email, buyer_phone,
-		       shipping_address, line_items
+		       shipping_address, line_items, draft_order_id, draft_order_name
 		FROM orders
 		WHERE payment_link_id = $1
 	`, paymentLinkID).Scan(
@@ -222,6 +251,8 @@ func GetCartPayload(paymentLinkID string) (*CartPayloadRecord, error) {
 		&buyerPhone,
 		&shippingAddress,
 		&lineItemsJSON,
+		&draftOrderID,
+		&draftOrderName,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -241,6 +272,12 @@ func GetCartPayload(paymentLinkID string) (*CartPayloadRecord, error) {
 	}
 	if shippingAddress != nil {
 		rec.ShippingAddress = *shippingAddress
+	}
+	if draftOrderID != nil {
+		rec.DraftOrderID = *draftOrderID
+	}
+	if draftOrderName != nil {
+		rec.DraftOrderName = *draftOrderName
 	}
 	rec.LineItemsJSON = lineItemsJSON
 

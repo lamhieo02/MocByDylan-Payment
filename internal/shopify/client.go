@@ -84,6 +84,9 @@ type OrderResponse struct {
 	Name            string `json:"name"`
 	OrderStatusURL  string `json:"order_status_url"`
 	FinancialStatus string `json:"financial_status"`
+	// Email is the order-level email returned by Shopify after creation.
+	// Used to confirm the address Shopify sent the receipt to.
+	Email           string `json:"email,omitempty"`
 }
 
 // orderEnvelope wraps the Shopify order response.
@@ -138,17 +141,28 @@ type DraftOrderRequest struct {
 	DraftOrder DraftOrderBody `json:"draft_order"`
 }
 
+// DraftOrderShippingLine sets the shipping cost on the draft order.
+// Using a custom title + price (no handle) lets us record the PayOS-derived
+// shipping fee without needing a pre-configured Shopify shipping rate.
+type DraftOrderShippingLine struct {
+	Title string `json:"title"`
+	Price string `json:"price"` // decimal string in store currency, e.g. "35000"
+}
+
 // DraftOrderBody contains the fields accepted by POST /draft_orders.json.
 // Unlike OrderBody, financial_status and transactions are not sent here;
-// payment is recorded by calling CompleteDraftOrder after creation.
+// payment is recorded by calling CompleteDraftOrderGQL after creation.
 type DraftOrderBody struct {
-	LineItems       []LineItem       `json:"line_items"`
-	Customer        *Customer        `json:"customer,omitempty"`
-	Email           string           `json:"email,omitempty"`
-	ShippingAddress *ShippingAddress `json:"shipping_address,omitempty"`
-	BillingAddress  *ShippingAddress `json:"billing_address,omitempty"`
-	Note            string           `json:"note,omitempty"`
-	Tags            string           `json:"tags,omitempty"`
+	LineItems       []LineItem              `json:"line_items"`
+	Customer        *Customer              `json:"customer,omitempty"`
+	// Email is the order-level email address. Shopify sends the Order Confirmation
+	// email to this address automatically when the draft order is completed.
+	Email           string                 `json:"email,omitempty"`
+	ShippingAddress *ShippingAddress       `json:"shipping_address,omitempty"`
+	BillingAddress  *ShippingAddress       `json:"billing_address,omitempty"`
+	ShippingLine    *DraftOrderShippingLine `json:"shipping_line,omitempty"`
+	Note            string                 `json:"note,omitempty"`
+	Tags            string                 `json:"tags,omitempty"`
 }
 
 // DraftOrderResponse holds the fields returned by the Shopify DraftOrder API.
@@ -199,8 +213,9 @@ func CreateDraftOrder(req DraftOrderRequest) (*DraftOrderResponse, error) {
 }
 
 // CompleteDraftOrder marks the draft order as paid and converts it into a
-// regular Shopify order. The returned DraftOrderResponse.OrderID contains
-// the ID of the resulting order.
+// regular Shopify order via the REST API. The returned DraftOrderResponse.OrderID
+// contains the ID of the resulting order.
+// Prefer CompleteDraftOrderGQL which returns the full order details in one call.
 func CompleteDraftOrder(draftOrderID int64) (*DraftOrderResponse, error) {
 	url := adminURL(fmt.Sprintf("draft_orders/%d/complete.json", draftOrderID))
 	httpReq, err := http.NewRequest(http.MethodPut, url, nil)
@@ -225,6 +240,143 @@ func CompleteDraftOrder(draftOrderID int64) (*DraftOrderResponse, error) {
 		return nil, fmt.Errorf("shopify: cannot parse complete draft order response: %w", err)
 	}
 	return &env.DraftOrder, nil
+}
+
+// ─── GraphQL draftOrderComplete ───────────────────────────────────────────────
+
+// draftOrderCompleteMutation completes a draft order and returns the resulting
+// Shopify order. The order email and name are requested so we can log the
+// address Shopify sends the Order Confirmation email to.
+const draftOrderCompleteMutation = `
+mutation draftOrderComplete($id: ID!) {
+  draftOrderComplete(id: $id) {
+    userErrors {
+      field
+      message
+    }
+    draftOrder {
+      id
+      order {
+        id
+        name
+        legacyResourceId
+        displayFinancialStatus
+        email
+      }
+    }
+  }
+}`
+
+type draftOrderCompleteResponseData struct {
+	DraftOrderComplete struct {
+		UserErrors []struct {
+			Field   []string `json:"field"`
+			Message string   `json:"message"`
+		} `json:"userErrors"`
+		DraftOrder *struct {
+			ID    string `json:"id"`
+			Order *struct {
+				ID                     string `json:"id"`
+				Name                   string `json:"name"`
+				LegacyResourceID       string `json:"legacyResourceId"`
+				DisplayFinancialStatus string `json:"displayFinancialStatus"`
+				Email                  string `json:"email"`
+			} `json:"order"`
+		} `json:"draftOrder"`
+	} `json:"draftOrderComplete"`
+}
+
+// CompleteDraftOrderGQL completes a Shopify draft order via the Admin GraphQL API
+// (draftOrderComplete mutation). It converts the draft order into a paid regular
+// order and returns the resulting order details as an OrderResponse.
+//
+// When the draft order was created with an email address, Shopify automatically
+// sends the Order Confirmation email to that address upon completion — no
+// additional sendReceipt flag is required.
+func CompleteDraftOrderGQL(draftOrderID int64) (*OrderResponse, error) {
+	gid := fmt.Sprintf("gid://shopify/DraftOrder/%d", draftOrderID)
+	variables := map[string]any{"id": gid}
+
+	data, err := doGraphQL(draftOrderCompleteMutation, variables)
+	if err != nil {
+		return nil, err
+	}
+
+	var result draftOrderCompleteResponseData
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("shopify: cannot parse draftOrderComplete data: %w", err)
+	}
+
+	if len(result.DraftOrderComplete.UserErrors) > 0 {
+		msgs := make([]string, len(result.DraftOrderComplete.UserErrors))
+		for i, ue := range result.DraftOrderComplete.UserErrors {
+			msgs[i] = fmt.Sprintf("%s: %s", strings.Join(ue.Field, "."), ue.Message)
+		}
+		return nil, fmt.Errorf("shopify: draftOrderComplete userErrors: %s", strings.Join(msgs, "; "))
+	}
+
+	if result.DraftOrderComplete.DraftOrder == nil || result.DraftOrderComplete.DraftOrder.Order == nil {
+		return nil, fmt.Errorf("shopify: draftOrderComplete returned no order")
+	}
+
+	order := result.DraftOrderComplete.DraftOrder.Order
+	var numericID int64
+	fmt.Sscanf(order.LegacyResourceID, "%d", &numericID)
+
+	return &OrderResponse{
+		ID:              numericID,
+		Name:            order.Name,
+		FinancialStatus: order.DisplayFinancialStatus,
+		Email:           order.Email,
+	}, nil
+}
+
+// ─── Order Transaction ────────────────────────────────────────────────────────
+
+// TransactionRequest is the REST payload for POST /orders/{id}/transactions.json.
+// Used to record the PayOS payment against the completed Shopify order.
+type TransactionRequest struct {
+	Transaction TransactionBody `json:"transaction"`
+}
+
+// TransactionBody holds the payment details.
+type TransactionBody struct {
+	Kind          string `json:"kind"`          // "sale"
+	Status        string `json:"status"`        // "success"
+	Amount        string `json:"amount"`        // decimal string e.g. "350000"
+	Currency      string `json:"currency"`      // "VND"
+	Gateway       string `json:"gateway"`       // "payos"
+	Authorization string `json:"authorization"` // paymentLinkId
+}
+
+// AddOrderTransaction posts a payment transaction to an existing Shopify order.
+// This records the PayOS settlement against the order created via draftOrderComplete,
+// providing a full audit trail inside Shopify's Timeline.
+func AddOrderTransaction(shopifyOrderID int64, req TransactionRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	url := adminURL(fmt.Sprintf("orders/%d/transactions.json", shopifyOrderID))
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Shopify-Access-Token", os.Getenv("SHOPIFY_ADMIN_API_TOKEN"))
+
+	resp, err := HTTPClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("shopify: AddOrderTransaction HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	return nil
 }
 
 // ─── GraphQL orderCreate ─────────────────────────────────────────────────────
@@ -346,6 +498,10 @@ type gqlLineItemInput struct {
 
 type gqlOrderInput struct {
 	LineItems       []gqlLineItemInput     `json:"lineItems"`
+	// Email is the order-level email address (OrderCreateOrderInput.email).
+	// This is required for sendReceipt:true to deliver the Shopify order
+	// confirmation email to the customer. It is distinct from customer.toUpsert.email.
+	Email           string                 `json:"email,omitempty"`
 	Customer        *gqlCustomerInput      `json:"customer,omitempty"`
 	ShippingAddress *gqlAddressInput       `json:"shippingAddress,omitempty"`
 	BillingAddress  *gqlAddressInput       `json:"billingAddress,omitempty"`
@@ -367,6 +523,7 @@ type gqlOptionsInput struct {
 
 // orderCreateMutation is the GraphQL mutation sent to /admin/api/{version}/graphql.json.
 // legacyResourceId returns the plain integer Shopify order ID (same as the REST id field).
+// email is returned so we can log and confirm the address Shopify will send the receipt to.
 const orderCreateMutation = `
 mutation orderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
   orderCreate(order: $order, options: $options) {
@@ -379,6 +536,7 @@ mutation orderCreate($order: OrderCreateOrderInput!, $options: OrderCreateOption
       name
       legacyResourceId
       displayFinancialStatus
+      email
     }
   }
 }`
@@ -394,6 +552,7 @@ type orderCreateResponseData struct {
 			Name                   string `json:"name"`
 			LegacyResourceID       string `json:"legacyResourceId"`
 			DisplayFinancialStatus string `json:"displayFinancialStatus"`
+			Email                  string `json:"email"`
 		} `json:"order"`
 	} `json:"orderCreate"`
 }
@@ -493,7 +652,12 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 
 	variables := map[string]any{
 		"order": gqlOrderInput{
-			LineItems:       gqlItems,
+			LineItems: gqlItems,
+			// order.email is the top-level email on OrderCreateOrderInput.
+			// Shopify uses this address when options.sendReceipt=true to
+			// deliver the official Order Confirmation notification. This is
+			// separate from customer.toUpsert.email (customer matching).
+			Email:           req.Order.Customer.Email,
 			Customer:        customer,
 			ShippingAddress: toGQLAddr(req.Order.ShippingAddress),
 			BillingAddress:  toGQLAddr(req.Order.BillingAddress),
@@ -541,6 +705,7 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 		ID:              numericID,
 		Name:            result.OrderCreate.Order.Name,
 		FinancialStatus: result.OrderCreate.Order.DisplayFinancialStatus,
+		Email:           result.OrderCreate.Order.Email,
 	}, nil
 }
 

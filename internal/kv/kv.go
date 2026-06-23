@@ -50,7 +50,7 @@ type LineItem struct {
 }
 
 // CartPayload is stored against the paymentLinkId key in Redis.
-// The webhook handler reads this to create the Shopify order.
+// The webhook handler reads this to complete the Shopify Draft Order.
 type CartPayload struct {
 	OrderCode       int64      `json:"orderCode"`
 	Amount          int64      `json:"amount"` // VND, e.g. 150000
@@ -59,6 +59,11 @@ type CartPayload struct {
 	BuyerPhone      string     `json:"buyerPhone"`
 	ShippingAddress string     `json:"shippingAddress"` // full address string entered by buyer
 	LineItems       []LineItem `json:"lineItems"`
+	// DraftOrderID and DraftOrderName are set immediately after Draft Order
+	// creation in create_payment. The webhook handler uses DraftOrderID to
+	// complete the draft order instead of creating a new one.
+	DraftOrderID   int64  `json:"draftOrderId,omitempty"`
+	DraftOrderName string `json:"draftOrderName,omitempty"`
 }
 
 // Set stores value under key with a TTL (seconds). Value is JSON-encoded.

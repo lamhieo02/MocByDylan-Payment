@@ -5,13 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
+	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
 
 // createPaymentReq is the body sent from the Shopify storefront JS.
@@ -109,6 +112,14 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── Build Shopify Draft Order immediately ─────────────────────────────────
+	// Creating the draft order here (before payment) means Shopify reserves
+	// inventory and has the order ready. When the PayOS webhook fires, we
+	// complete the draft order instead of creating a new one — ensuring no
+	// duplicate orders and enabling Shopify's automatic Order Confirmation email.
+	kvItems := toKVItems(req.LineItems)
+	draftOrderID, draftOrderName := createDraftOrder(req, payosResp.PaymentLinkID)
+
 	kvPayload := kv.CartPayload{
 		OrderCode:       req.OrderCode,
 		Amount:          req.Amount,
@@ -116,7 +127,9 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		BuyerEmail:      req.BuyerEmail,
 		BuyerPhone:      req.BuyerPhone,
 		ShippingAddress: req.ShippingAddress,
-		LineItems:       toKVItems(req.LineItems),
+		LineItems:       kvItems,
+		DraftOrderID:    draftOrderID,
+		DraftOrderName:  draftOrderName,
 	}
 	if err := kv.Set(payosResp.PaymentLinkID, kvPayload, 20*60); err != nil {
 		fmt.Printf("[create-payment] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)
@@ -136,6 +149,13 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		LineItems:       kvPayload.LineItems,
 	}); err != nil {
 		fmt.Printf("[create-payment] DB SaveOrder error for %s: %v\n", payosResp.PaymentLinkID, err)
+	}
+
+	// Persist draft order IDs to DB (separate update so SaveOrder remains idempotent).
+	if draftOrderID > 0 {
+		if err := db.UpdateDraftOrder(payosResp.PaymentLinkID, draftOrderID, draftOrderName); err != nil {
+			log.Printf("[create-payment] DB UpdateDraftOrder error for %s: %v", payosResp.PaymentLinkID, err)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -159,4 +179,98 @@ func toKVItems(items []lineItem) []kv.LineItem {
 		}
 	}
 	return out
+}
+
+// createDraftOrder creates a Shopify Draft Order for the given payment request.
+// It returns the draft order ID and name. On failure it logs the error and
+// returns (0, "") — the caller falls back to creating a new order at webhook time.
+func createDraftOrder(req createPaymentReq, paymentLinkID string) (id int64, name string) {
+	firstName, lastName := shopify.ParseName(req.BuyerName)
+
+	// Fallback: when buyer has a single name, use it as both first and last so
+	// Shopify accepts the shipping address (requires non-empty last_name).
+	addrLastName := lastName
+	if addrLastName == "" {
+		addrLastName = firstName
+	}
+
+	// Derive shipping fee: PayOS amount − sum of line item prices.
+	var lineSubtotalVND int64
+	for _, it := range req.LineItems {
+		lineSubtotalVND += (it.Price / 100) * int64(it.Quantity)
+	}
+	shippingFeeVND := req.Amount - lineSubtotalVND
+	if shippingFeeVND < 0 {
+		shippingFeeVND = 0
+	}
+
+	// Extract city from the last comma-separated segment of "street, ward, province".
+	shippingCity := ""
+	if req.ShippingAddress != "" {
+		parts := strings.Split(req.ShippingAddress, ", ")
+		if len(parts) > 0 {
+			shippingCity = strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+
+	lineItems := make([]shopify.LineItem, 0, len(req.LineItems))
+	for _, it := range req.LineItems {
+		if it.VariantID > 0 {
+			lineItems = append(lineItems, shopify.LineItem{
+				VariantID: it.VariantID,
+				Quantity:  it.Quantity,
+			})
+		}
+	}
+
+	var shippingAddr *shopify.ShippingAddress
+	if req.ShippingAddress != "" {
+		shippingAddr = &shopify.ShippingAddress{
+			FirstName:   firstName,
+			LastName:    addrLastName,
+			Phone:       req.BuyerPhone,
+			Address1:    req.ShippingAddress,
+			City:        shippingCity,
+			Country:     "Vietnam",
+			CountryCode: "VN",
+		}
+	}
+
+	var shippingLine *shopify.DraftOrderShippingLine
+	if shippingFeeVND > 0 {
+		shippingLine = &shopify.DraftOrderShippingLine{
+			Title: "Phí vận chuyển",
+			Price: fmt.Sprintf("%d", shippingFeeVND),
+		}
+	}
+
+	noteText := fmt.Sprintf("PayOS QR payment link created. paymentLinkId: %s", paymentLinkID)
+
+	draftReq := shopify.DraftOrderRequest{
+		DraftOrder: shopify.DraftOrderBody{
+			LineItems: lineItems,
+			Customer: &shopify.Customer{
+				Email:     req.BuyerEmail,
+				FirstName: firstName,
+				LastName:  lastName,
+				Phone:     req.BuyerPhone,
+			},
+			Email:           req.BuyerEmail,
+			ShippingAddress: shippingAddr,
+			BillingAddress:  shippingAddr,
+			ShippingLine:    shippingLine,
+			Note:            noteText,
+			Tags:            "payos,qr-transfer,draft",
+		},
+	}
+
+	draft, err := shopify.CreateDraftOrder(draftReq)
+	if err != nil {
+		log.Printf("[create-payment] Shopify CreateDraftOrder FAILED | paymentLinkId=%s | error=%v", paymentLinkID, err)
+		return 0, ""
+	}
+
+	log.Printf("[create-payment] Draft Order Created | DraftID=%d | DraftName=%s | Email=%s | PaymentLinkID=%s",
+		draft.ID, draft.Name, req.BuyerEmail, paymentLinkID)
+	return draft.ID, draft.Name
 }

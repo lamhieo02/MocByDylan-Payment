@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/db"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/kv"
@@ -15,6 +16,10 @@ import (
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/payos"
 	"github.com/mocbydylan/shopify-mocbydylan-payos-payment/internal/shopify"
 )
+
+// waitDraftRetry is a variable so tests can replace it with a no-op to avoid
+// sleeping during unit tests.
+var waitDraftRetry = func(seconds int) { time.Sleep(time.Duration(seconds) * time.Second) }
 
 type webhookBody struct {
 	Code      string          `json:"code"`
@@ -132,7 +137,15 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[webhook] payload: %+v", payload)
+	// Warn when buyer email is missing: Shopify cannot send the Order Confirmation
+	// email without a recipient address. The order will still be created, but no
+	// receipt will be delivered even if sendReceipt=true.
+	if payload.BuyerEmail == "" {
+		log.Printf("[webhook] WARNING: buyerEmail is empty for paymentLinkId=%s — Shopify Order Confirmation email will NOT be sent", data.PaymentLinkID)
+	}
+
+	log.Printf("[webhook] Webhook Received | PaymentLinkID=%s | Amount=%d | BuyerEmail=%s | DraftOrderID=%d | DraftOrderName=%s",
+		data.PaymentLinkID, data.Amount, payload.BuyerEmail, payload.DraftOrderID, payload.DraftOrderName)
 
 	firstName, lastName := shopify.ParseName(payload.BuyerName)
 	lineItems := toShopifyLineItems(payload.LineItems)
@@ -202,32 +215,105 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 				Gateway:       "payos",
 				Authorization: data.PaymentLinkID,
 			}},
-			Note:                   orderNote,
-			Tags:                   "payos,qr-transfer",
-			SendReceipt:            false,
-			SendFulfillmentReceipt: false,
-			ShippingFeeVND:         shippingFeeVND,
+		Note:                   orderNote,
+		Tags:                   "payos,qr-transfer",
+		// sendReceipt=true instructs Shopify to send the official Order Confirmation
+		// email (via the store's Notification template) to the order.email address.
+		// order.email is populated from payload.BuyerEmail in the GQL input layer.
+		SendReceipt:            true,
+		SendFulfillmentReceipt: false,
+		ShippingFeeVND:         shippingFeeVND,
 		},
 	}
-
-	log.Printf("[webhook] orderReq (CreateOrder): %+v", orderReq)
 
 	var shopifyOrderID int64
 	var shopifyOrderName string
 	var shopifyErrMsg string
 	var dbNote string
 
-	created, shopifyErr := shopify.CreateOrderGQL(orderReq)
-	if shopifyErr != nil {
-		// Payment is already successful — DB is source of truth for fulfillment.
-		fmt.Printf("[webhook] Shopify CreateOrderGQL failed (bypass) paymentLinkId=%s: %v\n", data.PaymentLinkID, shopifyErr)
-		shopifyErrMsg = shopifyErr.Error()
-		dbNote = "shopify CreateOrder: " + shopifyErr.Error()
-	} else {
-		shopifyOrderID = created.ID
-		shopifyOrderName = created.Name
-		fmt.Printf("[webhook] Shopify order created: %s (order_id=%d) for paymentLinkId=%s\n",
-			shopifyOrderName, shopifyOrderID, data.PaymentLinkID)
+	// ── Path A: Complete existing Draft Order ─────────────────────────────────
+	// Primary path: when a Draft Order was created at payment-link time, complete
+	// it now. draftOrderComplete triggers Shopify's standard order notification
+	// pipeline, which automatically sends the Order Confirmation email to the
+	// address on the draft order — no sendReceipt flag required.
+	if payload.DraftOrderID > 0 {
+		log.Printf("[webhook] Draft Completion Started | DraftID=%d | DraftName=%s | PaymentLinkID=%s",
+			payload.DraftOrderID, payload.DraftOrderName, data.PaymentLinkID)
+
+		completed, completeErr := completeDraftWithRetry(payload.DraftOrderID, data.PaymentLinkID)
+		if completeErr != nil {
+			// Draft completion failed after all retries. Payment is already confirmed
+			// by PayOS — fall through to Path B (GQL fallback) to avoid a lost order.
+			log.Printf("[webhook] CRITICAL: Draft completion failed after retries | DraftID=%d | PaymentLinkID=%s | error=%v",
+				payload.DraftOrderID, data.PaymentLinkID, completeErr)
+			shopifyErrMsg = "draft completion failed: " + completeErr.Error()
+			dbNote = shopifyErrMsg
+		} else {
+			shopifyOrderID = completed.ID
+			shopifyOrderName = completed.Name
+			log.Printf("[webhook] Draft Completed Successfully | DraftID=%d | OrderID=%d | OrderNumber=%s | Email=%s | FinancialStatus=%s | PaymentLinkID=%s",
+				payload.DraftOrderID,
+				shopifyOrderID,
+				shopifyOrderName,
+				completed.Email,
+				completed.FinancialStatus,
+				data.PaymentLinkID,
+			)
+			if completed.Email == "" {
+				log.Printf("[webhook] WARNING: Shopify returned empty email for order %s (ID=%d) — Order Confirmation email may not be sent",
+					shopifyOrderName, shopifyOrderID)
+			}
+
+			// Record the PayOS transaction against the completed order for audit trail.
+			txErr := shopify.AddOrderTransaction(shopifyOrderID, shopify.TransactionRequest{
+				Transaction: shopify.TransactionBody{
+					Kind:          "sale",
+					Status:        "success",
+					Amount:        fmt.Sprintf("%d", data.Amount),
+					Currency:      "VND",
+					Gateway:       "payos",
+					Authorization: data.PaymentLinkID,
+				},
+			})
+			if txErr != nil {
+				log.Printf("[webhook] WARNING: AddOrderTransaction failed for order %d: %v", shopifyOrderID, txErr)
+			} else {
+				log.Printf("[webhook] PayOS transaction recorded | OrderID=%d | Amount=%d | Ref=%s", shopifyOrderID, data.Amount, data.Reference)
+			}
+		}
+	}
+
+	// ── Path B: GQL fallback ──────────────────────────────────────────────────
+	// Triggered when: (1) no draft order exists (draft creation failed at
+	// payment time or pre-dates this architecture), or (2) draft completion
+	// failed above. Keeps backward-compatibility and ensures no paid order is lost.
+	if shopifyOrderID == 0 {
+		log.Printf("[webhook] calling CreateOrderGQL (fallback) | paymentLinkId=%s | buyerEmail=%s | sendReceipt=%v | amount=%d | lineItems=%d",
+			data.PaymentLinkID, payload.BuyerEmail, orderReq.Order.SendReceipt, data.Amount, len(lineItems))
+
+		created, createErr := shopify.CreateOrderGQL(orderReq)
+		if createErr != nil {
+			log.Printf("[webhook] Shopify CreateOrderGQL FAILED | paymentLinkId=%s | error=%v", data.PaymentLinkID, createErr)
+			if shopifyErrMsg == "" {
+				shopifyErrMsg = createErr.Error()
+			}
+			dbNote = "shopify CreateOrder: " + createErr.Error()
+		} else {
+			shopifyOrderID = created.ID
+			shopifyOrderName = created.Name
+			receiptWillSend := created.Email != ""
+			log.Printf("[webhook] Order Created via GQL (fallback) | ID=%d | OrderNumber=%s | Email=%s | PaymentLinkID=%s | SendReceipt=%v | FinancialStatus=%s",
+				shopifyOrderID,
+				shopifyOrderName,
+				created.Email,
+				data.PaymentLinkID,
+				receiptWillSend,
+				created.FinancialStatus,
+			)
+			if !receiptWillSend {
+				log.Printf("[webhook] WARNING: Shopify returned empty email for order %s (ID=%d) — Order Confirmation email may not be sent", shopifyOrderName, shopifyOrderID)
+			}
+		}
 	}
 
 	if err := db.UpdateOrderPaid(data.PaymentLinkID, shopifyOrderID, shopifyOrderName, data.Reference, data.TransactionDateTime, dbNote); err != nil {
@@ -287,6 +373,8 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 // cartPayloadFromDB converts a db.CartPayloadRecord (PostgreSQL fallback) into the
 // kv.CartPayload structure expected by the rest of the webhook handler.
+// DraftOrderID and DraftOrderName are forwarded so the draft completion path works
+// even when the Redis key has expired and we fall back to the database.
 func cartPayloadFromDB(rec *db.CartPayloadRecord) (*kv.CartPayload, error) {
 	var items []kv.LineItem
 	if len(rec.LineItemsJSON) > 0 {
@@ -302,7 +390,43 @@ func cartPayloadFromDB(rec *db.CartPayloadRecord) (*kv.CartPayload, error) {
 		BuyerPhone:      rec.BuyerPhone,
 		ShippingAddress: rec.ShippingAddress,
 		LineItems:       items,
+		DraftOrderID:    rec.DraftOrderID,
+		DraftOrderName:  rec.DraftOrderName,
 	}, nil
+}
+
+// completeDraftWithRetry attempts to complete the Shopify Draft Order up to
+// maxDraftRetries times with exponential backoff. It is called from the PayOS
+// webhook handler after a successful payment confirmation.
+//
+// Why retry: Draft Order completion can transiently fail due to Shopify API
+// rate-limits or network hiccups. Since the PayOS payment is already confirmed,
+// we must not give up silently — every retry keeps the order recovery window open.
+// If all retries fail, the caller falls back to CreateOrderGQL to avoid data loss.
+func completeDraftWithRetry(draftOrderID int64, paymentLinkID string) (*shopify.OrderResponse, error) {
+	const maxDraftRetries = 10
+	// Attempts 1-3: quick backoff (2s, 5s, 10s).
+	// Attempts 4-10: fixed 25s — gives Shopify time to recover from rate-limits
+	// or transient outages while keeping the total window under ~3.5 minutes.
+	backoff := []int{2, 5, 10, 25, 25, 25, 25, 25, 25, 25}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxDraftRetries; attempt++ {
+		order, err := shopify.CompleteDraftOrderGQL(draftOrderID)
+		if err == nil {
+			return order, nil
+		}
+		lastErr = err
+		log.Printf("[webhook] Draft completion attempt %d/%d FAILED | DraftID=%d | PaymentLinkID=%s | error=%v",
+			attempt, maxDraftRetries, draftOrderID, paymentLinkID, err)
+
+		if attempt < maxDraftRetries {
+			sleepSec := backoff[attempt-1]
+			log.Printf("[webhook] Retrying draft completion in %ds | DraftID=%d", sleepSec, draftOrderID)
+			waitDraftRetry(sleepSec)
+		}
+	}
+	return nil, fmt.Errorf("all %d attempts failed: %w", maxDraftRetries, lastErr)
 }
 
 func toShopifyLineItems(items []kv.LineItem) []shopify.LineItem {
