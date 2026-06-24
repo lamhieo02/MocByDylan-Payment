@@ -724,12 +724,18 @@ func CreateOrderGQL(req OrderRequest) (*OrderResponse, error) {
 
 // ─── Payment Gateway Lookup ───────────────────────────────────────────────────
 
-// FetchPaymentGatewayID queries the Shopify Admin REST API for all payment
-// gateways and returns the GID of the first one whose name matches (case-insensitive).
+// FetchPaymentGatewayID returns the GID of a Shopify manual payment gateway by
+// name (case-insensitive), e.g. "Bank Deposit" → "gid://shopify/PaymentGateway/123".
 //
-// Uses REST (GET /payment_gateways.json) because the GraphQL QueryRoot does not
-// expose a paymentGateways field in the Admin API.
-// The returned GID looks like: "gid://shopify/PaymentGateway/12345678"
+// Requires the API token to have the read_payment_gateways scope.
+// If you get HTTP 404, add that scope in:
+//
+//	Shopify Admin → Apps → Develop apps → [Your app] → Configuration → API scopes
+//	→ tick "read_payment_gateways" → Save → reinstall → copy new token to SHOPIFY_ADMIN_API_TOKEN
+//
+// Alternatively, run the helper binary to get the ID without scope changes:
+//
+//	go run ./cmd/get-gateway-id/main.go
 func FetchPaymentGatewayID(name string) (string, error) {
 	httpReq, err := http.NewRequest(http.MethodGet, adminURL("payment_gateways.json"), nil)
 	if err != nil {
@@ -744,8 +750,13 @@ func FetchPaymentGatewayID(name string) (string, error) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 404 {
+		return "", fmt.Errorf("HTTP 404 — token lacks read_payment_gateways scope. " +
+			"Add scope in Shopify Admin → Apps → Develop apps → [App] → Configuration → API scopes, " +
+			"or hardcode SHOPIFY_PAYOS_GATEWAY_ID (run: go run ./cmd/get-gateway-id/main.go)")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("shopify: FetchPaymentGatewayID HTTP %d: %s", resp.StatusCode, string(raw))
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(raw))
 	}
 
 	var result struct {
@@ -755,7 +766,7 @@ func FetchPaymentGatewayID(name string) (string, error) {
 		} `json:"payment_gateways"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", fmt.Errorf("shopify: cannot parse payment_gateways: %w", err)
+		return "", fmt.Errorf("cannot parse response: %w", err)
 	}
 
 	nameLower := strings.ToLower(name)
@@ -764,7 +775,11 @@ func FetchPaymentGatewayID(name string) (string, error) {
 			return fmt.Sprintf("gid://shopify/PaymentGateway/%d", gw.ID), nil
 		}
 	}
-	return "", fmt.Errorf("shopify: payment gateway %q not found (available gateways returned %d entries)", name, len(result.PaymentGateways))
+	available := make([]string, len(result.PaymentGateways))
+	for i, gw := range result.PaymentGateways {
+		available[i] = gw.Name
+	}
+	return "", fmt.Errorf("gateway %q not found; available: %s", name, strings.Join(available, ", "))
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────

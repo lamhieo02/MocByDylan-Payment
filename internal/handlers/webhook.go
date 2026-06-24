@@ -24,34 +24,39 @@ import (
 var waitDraftRetry = func(seconds int) { time.Sleep(time.Duration(seconds) * time.Second) }
 
 // ── Payment gateway resolution ────────────────────────────────────────────────
-// gatewayID is resolved once and cached. Resolution order:
-//  1. SHOPIFY_PAYOS_GATEWAY_ID env var (explicit GID — fastest, no API call)
-//  2. Auto-lookup by SHOPIFY_PAYOS_GATEWAY_NAME env var (default: "Bank Deposit")
+// Resolution order:
+//  1. SHOPIFY_PAYOS_GATEWAY_ID  — explicit GID, no API call (fastest, recommended)
+//  2. SHOPIFY_PAYOS_GATEWAY_NAME — auto-lookup via REST (requires read_payment_gateways scope)
 //
-// This means zero manual setup: the existing "Bank Deposit" manual payment method
-// in Shopify Admin is used automatically, and the customer-facing label in
-// Customer Accounts shows its configured name.
+// To get the GID without adding a scope, run once:
+//
+//	go run ./cmd/get-gateway-id/main.go
+//
+// then set: SHOPIFY_PAYOS_GATEWAY_ID=gid://shopify/PaymentGateway/123456789
 var (
-	resolvedGatewayID   string
-	gatewayResolveOnce  sync.Once
+	resolvedGatewayID  string
+	gatewayResolveOnce sync.Once
 )
 
 func payosGatewayID() string {
 	gatewayResolveOnce.Do(func() {
-		// Explicit GID takes priority — no API call needed.
+		// Explicit GID takes priority — no API call.
 		if id := os.Getenv("SHOPIFY_PAYOS_GATEWAY_ID"); id != "" {
 			resolvedGatewayID = id
-			log.Printf("[webhook] payment gateway set from SHOPIFY_PAYOS_GATEWAY_ID: %s", id)
+			log.Printf("[webhook] payment gateway GID (env): %s", id)
 			return
 		}
-		// Auto-lookup by display name.
+		// Auto-lookup via REST; requires read_payment_gateways scope on the token.
 		name := os.Getenv("SHOPIFY_PAYOS_GATEWAY_NAME")
 		if name == "" {
-			name = "Bank Deposit" // matches the existing manual payment method
+			name = "Bank Deposit"
 		}
 		id, err := shopify.FetchPaymentGatewayID(name)
 		if err != nil {
-			log.Printf("[webhook] WARNING: cannot resolve payment gateway %q: %v — will use Shopify default (Manual)", name, err)
+			log.Printf("[webhook] WARNING: cannot resolve gateway %q: %v\n"+
+				"  → Payment label will show as \"Manual\".\n"+
+				"  → Fix: run `go run ./cmd/get-gateway-id/main.go` and set SHOPIFY_PAYOS_GATEWAY_ID",
+				name, err)
 			return
 		}
 		resolvedGatewayID = id
@@ -115,7 +120,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 
 	// Signature must use raw `data` JSON so all keys match PayOS (including new fields).
 	if !payos.VerifyPaymentWebhookSignature(body.Data, body.Signature) {
-		fmt.Printf("[webhook] signature mismatch for paymentLinkId=%s\n", data.PaymentLinkID)
+		log.Printf("[webhook] signature mismatch for paymentLinkId=%s", data.PaymentLinkID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -128,52 +133,71 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	// Atomically claim the processing right before touching any external system.
 	// Redis SET NX guarantees only one concurrent handler proceeds — eliminating
 	// the race window that existed when the flag was set at the end of the handler.
+	//
+	// If Redis is unavailable, we send a critical Discord alert so ops can
+	// manually recover the order. Returning 500 causes PayOS to retry, but if
+	// Redis stays down beyond the PayOS retry window the payment would be lost
+	// without this alert.
 	claimed, err := kv.TryMarkProcessed(data.PaymentLinkID)
 	if err != nil {
-		fmt.Printf("[webhook] TryMarkProcessed error for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		log.Printf("[webhook] TryMarkProcessed error for paymentLinkId=%s: %v", data.PaymentLinkID, err)
+		notify.SendOrderNotify(notify.OrderInfo{
+			OrderCode:     data.OrderCode,
+			Amount:        data.Amount,
+			PaymentLinkID: data.PaymentLinkID,
+			Reference:     data.Reference,
+			ShopifyErr:    "CRITICAL: Redis unavailable — idempotency check failed. Order NOT processed. Manual recovery required.",
+		})
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if !claimed {
-		fmt.Printf("[webhook] duplicate event for paymentLinkId=%s, skipping\n", data.PaymentLinkID)
+		log.Printf("[webhook] duplicate event for paymentLinkId=%s, skipping", data.PaymentLinkID)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	payload, err := kv.GetCartPayload(data.PaymentLinkID)
 	if err != nil {
-		fmt.Printf("[webhook] KV error for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		log.Printf("[webhook] KV error for paymentLinkId=%s: %v", data.PaymentLinkID, err)
 	}
 	if payload == nil {
 		// Redis TTL (20 min) may have expired before the webhook arrived.
 		// Fall back to PostgreSQL which has the same data persisted at link-creation time.
-		fmt.Printf("[webhook] Redis miss for paymentLinkId=%s — trying DB fallback\n", data.PaymentLinkID)
+		log.Printf("[webhook] Redis miss for paymentLinkId=%s — trying DB fallback", data.PaymentLinkID)
 		dbRec, dbErr := db.GetCartPayload(data.PaymentLinkID)
 		if dbErr != nil {
-			fmt.Printf("[webhook] DB fallback error for paymentLinkId=%s: %v\n", data.PaymentLinkID, dbErr)
+			log.Printf("[webhook] DB fallback error for paymentLinkId=%s: %v", data.PaymentLinkID, dbErr)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		if dbRec == nil {
-			fmt.Printf("[webhook] no cart data found (redis+db miss) for paymentLinkId=%s\n", data.PaymentLinkID)
+			log.Printf("[webhook] no cart data found (redis+db miss) for paymentLinkId=%s", data.PaymentLinkID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		converted, convErr := cartPayloadFromDB(dbRec)
 		if convErr != nil {
-			fmt.Printf("[webhook] DB record conversion error for paymentLinkId=%s: %v\n", data.PaymentLinkID, convErr)
+			log.Printf("[webhook] DB record conversion error for paymentLinkId=%s: %v", data.PaymentLinkID, convErr)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		payload = converted
-		fmt.Printf("[webhook] using DB fallback payload for paymentLinkId=%s\n", data.PaymentLinkID)
+		log.Printf("[webhook] using DB fallback payload for paymentLinkId=%s", data.PaymentLinkID)
 	}
 
 	// validate payload
 	if err := ValidateRequestDataWebhook(payload); err != nil {
-		fmt.Printf("[webhook] invalid payload for paymentLinkId=%s: %v\n", data.PaymentLinkID, err)
+		log.Printf("[webhook] invalid payload for paymentLinkId=%s: %v", data.PaymentLinkID, err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
+	}
+
+	// Amount sanity check: PayOS guarantees data.Amount == the linked amount,
+	// but log a warning if they diverge (e.g. PayOS config bug, partial payment edge case).
+	if payload.Amount > 0 && data.Amount != payload.Amount {
+		log.Printf("[webhook] WARNING: amount mismatch for paymentLinkId=%s — expected %d VND, PayOS reported %d VND. Proceeding with actual received amount.",
+			data.PaymentLinkID, payload.Amount, data.Amount)
 	}
 
 	// Warn when buyer email is missing: Shopify cannot send the Order Confirmation
@@ -353,7 +377,7 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := db.UpdateOrderPaid(data.PaymentLinkID, shopifyOrderID, shopifyOrderName, data.Reference, data.TransactionDateTime, dbNote); err != nil {
-		fmt.Printf("[webhook] DB UpdateOrderPaid error: %v\n", err)
+		log.Printf("[webhook] DB UpdateOrderPaid error: %v", err)
 	}
 
 	notify.SendOrderNotify(notify.OrderInfo{

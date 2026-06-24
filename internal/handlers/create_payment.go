@@ -132,7 +132,7 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		DraftOrderName:  draftOrderName,
 	}
 	if err := kv.Set(payosResp.PaymentLinkID, kvPayload, 20*60); err != nil {
-		fmt.Printf("[create-payment] KV set error for %s: %v\n", payosResp.PaymentLinkID, err)
+		log.Printf("[create-payment] KV set error for %s: %v", payosResp.PaymentLinkID, err)
 		jsonErr(w, "failed to set KV: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -148,7 +148,7 @@ func CreatePayment(w http.ResponseWriter, r *http.Request) {
 		ShippingAddress: req.ShippingAddress,
 		LineItems:       kvPayload.LineItems,
 	}); err != nil {
-		fmt.Printf("[create-payment] DB SaveOrder error for %s: %v\n", payosResp.PaymentLinkID, err)
+		log.Printf("[create-payment] DB SaveOrder error for %s: %v", payosResp.PaymentLinkID, err)
 	}
 
 	// Persist draft order IDs to DB (separate update so SaveOrder remains idempotent).
