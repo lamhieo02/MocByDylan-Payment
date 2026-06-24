@@ -463,11 +463,14 @@ func cartPayloadFromDB(rec *db.CartPayloadRecord) (*kv.CartPayload, error) {
 // rate-limits or network hiccups. Since the PayOS payment is already confirmed,
 // we must not give up silently — every retry keeps the order recovery window open.
 // If all retries fail, the caller falls back to CreateOrderGQL to avoid data loss.
-// completeDraftWithRetry attempts draftOrderComplete up to maxDraftRetries times.
-// paymentGatewayID is the Shopify GID of a Manual Payment Method (e.g.
-// "gid://shopify/PaymentGateway/12345678") set via SHOPIFY_PAYOS_GATEWAY_ID.
-// When non-empty, the customer-facing payment method label in Customer Accounts
-// shows the gateway name (e.g. "Thanh toán QR") instead of "Manual".
+//
+// Fail-fast: Shopify userErrors (validation failures) are non-retriable — the
+// same request will always fail. We detect them by the "userErrors" keyword and
+// return immediately instead of burning through all retry slots.
+//
+// paymentGatewayID is the Shopify GID of a Manual Payment Method set via
+// SHOPIFY_PAYOS_GATEWAY_ID. When the gateway is invalid, a single attempt fails
+// with "Invalid payment gateway" (userError) and we bail out immediately.
 func completeDraftWithRetry(draftOrderID int64, paymentLinkID string, paymentGatewayID string) (*shopify.OrderResponse, error) {
 	const maxDraftRetries = 10
 	// Attempts 1-3: quick backoff (2s, 5s, 10s).
@@ -484,6 +487,14 @@ func completeDraftWithRetry(draftOrderID int64, paymentLinkID string, paymentGat
 		lastErr = err
 		log.Printf("[webhook] Draft completion attempt %d/%d FAILED | DraftID=%d | PaymentLinkID=%s | error=%v",
 			attempt, maxDraftRetries, draftOrderID, paymentLinkID, err)
+
+		// Shopify userErrors are permanent validation failures (e.g. "Invalid payment
+		// gateway", "Draft order already completed"). Retrying is pointless — bail out
+		// immediately so the caller can fall back to Path B without delay.
+		if strings.Contains(err.Error(), "userErrors") {
+			log.Printf("[webhook] Non-retriable userError detected — aborting retry loop | DraftID=%d", draftOrderID)
+			return nil, fmt.Errorf("non-retriable: %w", lastErr)
+		}
 
 		if attempt < maxDraftRetries {
 			sleepSec := backoff[attempt-1]
