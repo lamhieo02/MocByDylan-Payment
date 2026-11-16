@@ -29,6 +29,9 @@ type createCODReq struct {
 	ShippingAddress string        `json:"shippingAddress"`
 	Note            string        `json:"note"`
 	LineItems       []codLineItem `json:"lineItems"`
+	// ReplacesPaymentLinkID is set when the buyer switches from the QR modal to
+	// COD; that PayOS link is cancelled and its draft order removed.
+	ReplacesPaymentLinkID string `json:"replacesPaymentLinkId"`
 }
 
 type codLineItem struct {
@@ -157,6 +160,12 @@ func CreateCODOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rep, err := prepareQRReplacement(req.ReplacesPaymentLinkID, phone)
+	if err == errQRAlreadyPaid {
+		jsonErr(w, "Đơn của bạn đã được thanh toán qua QR rồi nên không cần đặt COD nữa. Mộc sẽ liên hệ xác nhận đơn nhé!", http.StatusConflict)
+		return
+	}
+
 	firstName, lastName := shopify.ParseName(name)
 	addrLastName := lastName
 	if addrLastName == "" {
@@ -183,6 +192,7 @@ func CreateCODOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		note += "\nGhi chú của khách: " + n
 	}
+	note += rep.noteLine()
 
 	draft, err := shopify.CreateDraftOrderDetailed(shopify.DraftOrderRequest{
 		DraftOrder: shopify.DraftOrderBody{
@@ -213,12 +223,17 @@ func CreateCODOrder(w http.ResponseWriter, r *http.Request) {
 	if subtotal < threshold {
 		shippingFee = fee
 	}
-	if shippingFee > 0 {
-		if _, err := shopify.SetDraftOrderShippingLine(draft.ID, shopify.DraftOrderShippingLine{
-			Title: "Giao hàng tiêu chuẩn",
-			Price: fmt.Sprintf("%d", shippingFee),
-		}); err != nil {
-			log.Printf("[cod] SetDraftOrderShippingLine FAILED | draft=%d | error=%v", draft.ID, err)
+	shipTitle := "Giao hàng tiêu chuẩn"
+	if shippingFee == 0 {
+		shipTitle = "Miễn phí vận chuyển"
+	}
+	if _, err := shopify.SetDraftOrderShippingLine(draft.ID, shopify.DraftOrderShippingLine{
+		Title: shipTitle,
+		Price: fmt.Sprintf("%d", shippingFee),
+	}); err != nil {
+		log.Printf("[cod] SetDraftOrderShippingLine FAILED | draft=%d | fee=%d | error=%v", draft.ID, shippingFee, err)
+		// A missing free-shipping label is cosmetic; a missing fee is not.
+		if shippingFee > 0 {
 			_ = shopify.DeleteDraftOrder(draft.ID)
 			jsonErr(w, "Không tạo được đơn hàng, vui lòng thử lại", http.StatusBadGateway)
 			return
@@ -243,6 +258,7 @@ func CreateCODOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	total := subtotal + shippingFee
+	rep.finalize(orderName)
 	log.Printf("[cod] Order created | order=%s (%d) | total=%d | phone=%s", orderName, done.OrderID, total, phone)
 
 	notifyItems := make([]kv.LineItem, 0, len(draft.LineItems))
